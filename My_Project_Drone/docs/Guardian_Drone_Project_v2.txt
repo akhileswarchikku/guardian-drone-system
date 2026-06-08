@@ -1,0 +1,846 @@
+================================================================================
+GUARDIAN DRONE SYSTEM
+Autonomous Women Safety Response Platform
+Complete Project Document — Every Module Explained With Purpose
+================================================================================
+
+Project Author  : Akhileswar Pathinavalasa (Chikku)
+Role            : AI/ML Engineer | MS Business Analytics, Wichita State University
+Stack           : LangGraph · LangChain · PyTorch · YOLOv8 · AWS Bedrock · Pinecone · NIAR Research
+Version         : 2.0 | 2026 | Prototype → Government Approval
+Total Phases    : 6
+Timeline        : 8–12 Months
+Hardware Budget : ~$1,030
+Zero-Cost Phases: 1 through 4
+
+--------------------------------------------------------------------------------
+HOW TO READ THIS DOCUMENT
+--------------------------------------------------------------------------------
+Each module is a two-column block in the original doc.
+LEFT column  = what you build + exact steps.
+RIGHT column = WHY — what you achieve, why it cannot be skipped, how it connects.
+Read the WHY section first if you are unsure whether a task is worth doing.
+Exit criteria box at the end of each phase is a HARD GATE — every item must be
+checked before you advance to the next phase.
+
+================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================
+
+The Guardian Drone System is an end-to-end autonomous safety platform that:
+  - Detects physiological distress signals from a smartwatch
+  - Autonomously dispatches a drone from the nearest police station
+  - Tracks the victim even if she is moving in a vehicle
+  - Analyzes the scene using AI computer vision
+  - Notifies authorities
+  — without any human operator involvement from trigger to arrival.
+
+THE CORE INNOVATION
+No single piece of this technology is new in isolation. What does not exist is
+the fully integrated AI-orchestrated pipeline:
+
+  wearable biometric detection
+    → autonomous police-station drone dispatch
+    → moving victim tracking
+    → scene intelligence (building entry/exit analysis)
+    → fault-tolerant multi-drone handoff
+    → government management dashboard
+
+This orchestration layer — built with LangGraph, MAVLink, and YOLOv8 — is the
+patentable, novel contribution of this project.
+
+--------------------------------------------------------------------------------
+1.1 PROBLEM STATEMENT
+--------------------------------------------------------------------------------
+In India, a woman is assaulted every 16 minutes (NCRB data).
+The critical gap is between incident and police response:
+  - Urban areas  : 10–30 minutes average response time
+  - Rural areas  : 1–3 hours average response time
+
+Existing solutions (panic buttons, helpline apps) require conscious manual action
+from a woman who may be incapacitated or in too much danger to reach for her phone.
+
+This system eliminates that requirement entirely by detecting distress automatically
+from involuntary physiological signals.
+
+--------------------------------------------------------------------------------
+1.2 HOW IT WORKS — SEVEN STEPS
+--------------------------------------------------------------------------------
+1. Smartwatch continuously monitors HRV, GSR, breathing rate, and motion every 5s.
+2. AI model computes a danger score (0–100) against the user's personal baseline.
+3. If score > 70 for 15+ sustained seconds with 2+ signals in distress range,
+   SOS triggers automatically — no manual action needed.
+4. AI agents identify the nearest police drone station, compute optimal flight path,
+   and dispatch the drone autonomously.
+5. If victim is moving in a vehicle, drone tracks GPS in real time.
+6. If drone malfunctions, AI reroutes to next station and dispatches a second drone,
+   handing off all context within 30 seconds.
+7. On arrival, AI vision agent classifies the scene, maps building entries and exits,
+   tracks the threat, and streams live video to police command.
+   Police arrive with full situational awareness.
+   Drone logs all evidence. Mission closes. Drone returns autonomously.
+
+--------------------------------------------------------------------------------
+1.3 HARDWARE AND SOFTWARE SUMMARY
+--------------------------------------------------------------------------------
+Component           Model                       Role                    Cost
+---------------------------------------------------------------------------
+Drone Frame         Holybro X500 V2             Physical platform       ~$250
+Flight Controller   Pixhawk 6C (PX4)            Autonomous flight       ~$180
+AI Brain (Onboard)  NVIDIA Jetson Orin Nano     Edge AI inference       ~$250
+Camera              Intel RealSense D435i       Depth + RGB + IR vision ~$200
+LTE Module          Sixfab LTE HAT              Cloud comms             ~$80
+Wearable            Samsung Galaxy Watch/custom Biometric sensing       ~$70
+---------------------------------------------------------------------------
+TOTAL PROTOTYPE     1 drone                                             ~$1,030
+
+================================================================================
+PHASE 1 — BIOMETRIC ML DANGER DETECTION MODEL
+Duration: Month 1–2
+Goal: Build and validate the AI model that converts raw smartwatch signals
+      into a reliable danger score.
+Zero hardware required. Everything runs on your laptop.
+================================================================================
+
+--------------------------------------------------------------------------------
+MODULE 1.1 — DATASET ACQUISITION
+--------------------------------------------------------------------------------
+Primary:
+  - Download WESAD dataset from UCI ML Repository
+  - URL: https://archive.ics.uci.edu/dataset/465/wesad
+  - 15 subjects, chest + wrist sensors, labeled stress / baseline / amusement
+  - Contains: BVP (for HRV), EDA (GSR), accelerometer, temperature
+
+Secondary:
+  - Download DREAMER and DEAP from PhysioNet as supplementary data
+
+Setup:
+  - Create folder structure: data/raw/, data/processed/, data/features/
+  - Write loader script — verify all 15 subject .pkl files load without error
+  - Plot sample HRV, EDA, and accelerometer traces for 3 subjects (sanity check)
+
+WHY THIS MATTERS:
+  You cannot train a model without data. WESAD gives you 15 real human subjects
+  experiencing real physiological stress in a controlled lab — the gold standard
+  for this exact problem. Without this data your model is guessing. With it, you
+  have a scientifically validated foundation that government reviewers will accept.
+
+--------------------------------------------------------------------------------
+MODULE 1.2 — SIGNAL PREPROCESSING PIPELINE
+--------------------------------------------------------------------------------
+HRV signals:
+  - BVP/PPG: band-pass filter 0.5–4 Hz to remove motion artifacts
+  - Extract R-R intervals (inter-beat intervals) from PPG peaks
+  - Compute: RMSSD, SDNN, pNN50, LF/HF ratio, mean, std, range
+
+GSR signals:
+  - EDA: low-pass filter at 1 Hz, separate tonic + phasic components
+  - Tonic = slow arousal baseline, phasic = fast threat response spikes
+  - Extract: mean, std, peak count, peak amplitude, slope, rise time
+
+Accelerometer:
+  - Magnitude = sqrt(x²+y²+z²), band-pass 0.1–0.5 Hz for breathing
+  - Estimate breathing rate from oscillation frequency
+  - Extract: mean magnitude, std, spectral entropy
+
+Windowing:
+  - Apply 30-second sliding window with 5-second step across all signals
+  - Remove windows with >20% missing or artifact-contaminated data
+  - Write unit tests for all functions — validate against known signal examples
+
+WHY THIS MATTERS:
+  Raw sensor signals are dirty — motion artifacts, electrical noise, gaps.
+  Feeding dirty signals into a model means the model learns noise, not stress.
+  RMSSD (heart rate variability metric) is one of the most researched stress
+  biomarkers in medical literature — you need clean signals to compute it.
+
+--------------------------------------------------------------------------------
+MODULE 1.3 — PERSONAL BASELINE CALIBRATION
+--------------------------------------------------------------------------------
+  - Collect 2 weeks of passive wear data covering normal daily activities
+  - Compute per-user statistical profile: mean and std per feature
+  - Normalize all features as z-scores relative to personal baseline
+  - Implement PersonalBaseline class: fit(), normalize(), save(), load()
+  - Use exponential moving average (alpha=0.05) for incremental baseline updates
+  - Store baseline on device only — raw biometrics never leave the watch
+
+WHY THIS MATTERS:
+  Two people can have identical HRV values — one panicking, one completely calm
+  because that is their normal. Population-average model cannot tell them apart.
+  Personal baseline measures deviation from that person's own normal — far more
+  sensitive. This is the primary false-positive reduction step in the system.
+
+--------------------------------------------------------------------------------
+MODULE 1.4 — XGBOOST BASELINE CLASSIFIER
+--------------------------------------------------------------------------------
+  - Create feature matrix: (N_windows, 16 features) for all subjects
+  - Assign binary labels: WESAD label 2 (stress) → distress=1, all others → safe=0
+  - Train XGBoost with scale_pos_weight=3 to handle class imbalance
+  - Leave-one-subject-out cross-validation (LOSO-CV)
+  - Compute SHAP values — plot top 10 most predictive features
+  - Target: F1 > 0.78 on distress class
+  - Save as baseline_xgb.pkl
+
+WHY THIS MATTERS:
+  Before building the LSTM, verify that feature engineering is correct.
+  XGBoost trains in minutes and SHAP values show which signals matter most.
+  If XGBoost cannot beat 78% F1, something is wrong upstream — fix it here,
+  not after 30 epochs of LSTM training.
+
+--------------------------------------------------------------------------------
+MODULE 1.5 — LSTM DANGER CLASSIFIER
+--------------------------------------------------------------------------------
+Architecture:
+  - 2-layer LSTM, hidden size 128, dropout 0.3
+  - Input shape: (batch, 300 timesteps, 5 signals) — BVP, EDA, ACC_x, ACC_y, ACC_z
+  - Output: softmax → [P(safe), P(distress)]
+  - Danger score = P(distress) × 100
+
+Training:
+  - AdamW lr=1e-3, ReduceLROnPlateau scheduler, 30 epochs
+  - CrossEntropyLoss with class weights [1.0, 2.5] to penalize missed distress
+  - Full LOSO-CV across all 15 subjects
+  - Target: mean F1 > 0.83 on distress class
+  - Save best checkpoint: best_danger_model.pt
+
+WHY THIS MATTERS:
+  Unlike XGBoost which sees extracted statistics, LSTM processes the raw sequence
+  and learns temporal patterns: 'HRV dropped sharply while GSR spiked in last 8s'.
+  Stress has a time signature that statistics miss. This is the production model —
+  runs on the watch companion app every 5 seconds for the rest of the product's life.
+
+--------------------------------------------------------------------------------
+MODULE 1.6 — CONTEXTUAL GATING LAYER
+--------------------------------------------------------------------------------
+  - Multi-signal agreement: require 2 of 3 signals (HRV, GSR, breathing) in distress range
+  - Duration gate: sustained score >= 70 for minimum 15 seconds before SOS fires
+  - Location safety gate: GPS geofence for known safe zones raises threshold to 85
+  - Dismiss window: 10-second window after first trigger — double-tap to cancel
+  - Smoothing: rolling average of last 10 danger score readings (50-second window)
+  - Test: exercise scenario must NOT trigger, genuine fear scenario MUST trigger
+
+WHY THIS MATTERS:
+  A model with 83% accuracy still produces false alarms. In a safety system, a
+  false alarm dispatches a police drone unnecessarily — wasting resources and
+  eroding trust. The gating layer adds common-sense rules on top of ML output.
+  This is the difference between a demo toy and a deployable product.
+
+--------------------------------------------------------------------------------
+MODULE 1.7 — MODEL EXPORT AND OPTIMIZATION
+--------------------------------------------------------------------------------
+  - Export trained LSTM to ONNX format: torch.onnx.export()
+  - Validate ONNX outputs match PyTorch outputs (< 0.001 tolerance)
+  - Apply PyTorch INT8 dynamic quantization — 4x size reduction
+  - Benchmark: 1000 inference passes, mean + std. Target: < 50ms per window
+  - Write model card: training data, performance, known failure modes, limitations
+
+WHY THIS MATTERS:
+  A model that only runs on your laptop is not a product. ONNX export makes it
+  runnable on any device — watch companion phone, Jetson Orin Nano, future
+  smartwatch chip. INT8 quantization shrinks model 4x, critical for battery life.
+  Model card is what government technical reviewers read first.
+
+--------------------------------------------------------------------------------
+PHASE 1 EXIT CRITERIA — ALL MUST PASS BEFORE MOVING TO PHASE 2
+--------------------------------------------------------------------------------
+  [ ] LSTM F1 > 0.83 on distress class (LOSO-CV mean across all 15 subjects)
+  [ ] False positive rate < 15% — contextual gate blocks exercise scenarios
+  [ ] Model exported to ONNX, inference time < 50ms on standard CPU
+  [ ] All preprocessing unit tests passing in /tests/test_preprocessing.py
+  [ ] Model card written and committed to GitHub
+  [ ] All code pushed to GitHub with meaningful commit messages
+
+================================================================================
+PHASE 2 — AI ORCHESTRATION AGENTS (LANGGRAPH)
+Duration: Month 3–4
+Goal: Build the multi-agent system that connects danger score to autonomous
+      drone dispatch. Drone is still mocked — no hardware needed.
+================================================================================
+
+--------------------------------------------------------------------------------
+MODULE 2.1 — AGENT ARCHITECTURE DESIGN
+--------------------------------------------------------------------------------
+  - Define SharedState TypedDict:
+    victim_location, danger_score, drone_status, nearest_station,
+    flight_path, mission_status, malfunction_flag, handoff_complete
+  - Create LangGraph StateGraph with all 10 agent nodes
+  - Define conditional edges: danger threshold check, malfunction check, mission close
+  - Draw complete agent graph — save to docs/agent_graph.png
+  - Define agent interfaces in Pydantic: every input and output is typed — no raw strings
+
+WHY THIS MATTERS:
+  Designing the full agent graph before writing code forces you to confront every
+  edge case: no stations available, victim GPS lost, LLM call timeout, two
+  malfunctions in sequence. The StateGraph and Pydantic typed outputs mean every
+  agent communicates in structured data — not fragile strings that break when an
+  LLM rephrases its response.
+
+--------------------------------------------------------------------------------
+MODULE 2.2 — DRONE STATION REGISTRY (POSTGRESQL + POSTGIS)
+--------------------------------------------------------------------------------
+  - Set up PostgreSQL with PostGIS extension (via Docker for local development)
+  - Schema: station_id, name, lat, lon, drone_count, available_drones,
+    battery_levels, last_maintenance
+  - Implement geospatial query: nearest N stations within radius R,
+    filtered by drone_available=true
+  - Build FastAPI REST endpoints:
+    GET  /stations/nearest
+    POST /stations/{id}/dispatch
+    GET  /stations/{id}/status
+  - Seed database with 10 mock police station records at real GPS coordinates
+
+WHY THIS MATTERS:
+  The system needs to know, in real time, which police drone station is closest
+  to the victim, has a charged drone available, and has enough battery for a round
+  trip. PostGIS handles geospatial distance queries in milliseconds — critical when
+  you need an answer in under 2 seconds after SOS triggers. Without this registry,
+  the dispatch agent is blind.
+
+--------------------------------------------------------------------------------
+MODULE 2.3 — PATH PLANNING AGENT
+--------------------------------------------------------------------------------
+  - Implement A* pathfinding on a GPS grid overlaid on map tiles
+  - Cost function: distance (primary), battery consumption, signal strength, wind
+  - Load no-fly zones from OpenAirspace API — block those grid cells
+  - Dynamic re-planning: if victim moves > 100m from last known position, recompute
+  - Battery range check: if round-trip > 80% battery capacity, flag for handoff
+  - Expose as @tool decorated function within LangGraph agent
+
+WHY THIS MATTERS:
+  The fastest straight-line path may cross a no-fly zone, go through a building,
+  or exceed the drone's battery range. The path planning agent solves this in real
+  time. Battery-aware routing is especially critical for the handoff scenario.
+
+--------------------------------------------------------------------------------
+MODULE 2.4 — MALFUNCTION DETECTION AND HANDOFF AGENT
+--------------------------------------------------------------------------------
+  - Monitor drone telemetry every 500ms:
+    battery voltage, GPS lock, motor RPM, signal RSSI, altitude hold
+  - Malfunction triggers:
+    battery < 15%, GPS loss > 3 seconds, motor failure code, RSSI < -90 dBm
+  - Handoff sequence:
+    1. On fault: notify management, find ahead-station (not behind), dispatch Drone 2
+    2. Transfer context packet: victim GPS, danger level, mission timestamp, video state
+    3. Direct Drone 1 to nearest dockable station
+    4. Drone 1 docks, logs fault code, maintenance team alerted automatically
+  - All handoff steps must complete within 30 seconds of malfunction detection
+
+WHY THIS MATTERS:
+  This is the most innovative engineering contribution. When Drone 1 malfunctions,
+  the system must seamlessly transition to Drone 2 without victim coverage gap.
+  The handoff agent must find a station AHEAD of the victim's direction of travel —
+  not behind — which requires predicting where victim will be when Drone 2 arrives.
+  This is what makes this system fundamentally different from any existing product.
+
+--------------------------------------------------------------------------------
+MODULE 2.5 — MOCK DRONE API
+--------------------------------------------------------------------------------
+  - Build FastAPI mock server:
+    POST /launch
+    GET  /telemetry
+    POST /set_waypoint
+    POST /land
+    POST /rtl
+  - Mock telemetry: GPS coords, battery%, altitude, speed, camera_active,
+    motor_status, signal_rssi
+  - Fault injection: POST /inject_fault?type=
+    Types: battery_low, gps_loss, motor_failure, signal_loss
+  - Run 2 mock drone instances on ports 8001 and 8002 for multi-station testing
+
+WHY THIS MATTERS:
+  You cannot test agent logic against a real drone — it is dangerous and expensive.
+  The mock API is a safe, infinitely controllable drone. The fault injection endpoint
+  is the most important feature — trigger battery_low at exactly the right moment
+  to test whether your handoff agent reacts correctly.
+
+--------------------------------------------------------------------------------
+MODULE 2.6 — OPENROUTER LLM CONFIGURATION
+--------------------------------------------------------------------------------
+  - All LLM calls: base_url='https://openrouter.ai/api/v1', OPENROUTER_API_KEY from .env
+  - All agent decision outputs typed as Pydantic models — never parse raw LLM text
+  - Implement retry logic with tenacity: 3 retries, exponential backoff, fallback
+  - Test: run a complete agent LLM call, verify Pydantic output, verify retry on timeout
+
+WHY THIS MATTERS:
+  Using OpenRouter means you can switch LLM providers (OpenAI → Claude → Mistral)
+  in one line of code — if one provider has downtime during a real emergency.
+  Pydantic-typed outputs mean agent decisions are machine-readable, not prose.
+
+--------------------------------------------------------------------------------
+PHASE 2 EXIT CRITERIA — ALL MUST PASS BEFORE MOVING TO PHASE 3
+--------------------------------------------------------------------------------
+  [ ] All 10 LangGraph agents implemented with Pydantic-typed outputs
+  [ ] Full SOS-to-dispatch pipeline runs end-to-end against mock drone API
+  [ ] Malfunction and handoff completes within 30 seconds in all test scenarios
+  [ ] SOS-to-dispatch agent latency < 10 seconds measured
+  [ ] Moving victim at 60 km/h tracked correctly by tracking agent
+  [ ] All 5 integration tests passing in /tests/test_agents.py
+
+================================================================================
+PHASE 3 — DRONE SIMULATION (AIRSIM + PX4 SITL)
+Duration: Month 5–6
+Goal: Test the full AI system in a realistic drone simulator before touching hardware.
+================================================================================
+
+--------------------------------------------------------------------------------
+MODULE 3.1 — AIRSIM ENVIRONMENT SETUP
+--------------------------------------------------------------------------------
+  - Install Unreal Engine 4.27 and Microsoft AirSim plugin from GitHub
+  - Configure settings.json: SimMode=Multirotor, ClockSpeed=1
+  - Install PX4 SITL — simulates the Pixhawk flight controller in software
+  - Connect PX4 SITL to AirSim via MAVLink on localhost UDP port 14550
+  - Install DroneKit-Python: pip install dronekit
+  - Verify: arm → takeoff to 10m → hover 30 seconds → land (all in simulation)
+
+WHY THIS MATTERS:
+  Every bug found in simulation is a crash avoided in real life. AirSim physics
+  are accurate enough that flight behavior closely predicts real behavior. PX4 SITL
+  responds to the exact same MAVLink commands as the physical Pixhawk — so when
+  you plug in real hardware in Phase 5, your software is already proven.
+
+--------------------------------------------------------------------------------
+MODULE 3.2 — CONNECT LANGGRAPH AGENTS TO SIMULATED DRONE
+--------------------------------------------------------------------------------
+  - Create DroneKitAdapter class: wraps DroneKit in same interface as Phase 2 mock API
+  - Map:
+    /launch     → arm() + simple_takeoff()
+    /telemetry  → vehicle.battery + GPS
+    /set_waypoint → goto()
+  - Run full LangGraph agent pipeline against DroneKitAdapter on AirSim
+  - Verify visually: SOS trigger → drone takes off → navigates to victim GPS
+  - Write victim_sim.py: moves a GPS coordinate at configurable speed (km/h)
+
+WHY THIS MATTERS:
+  When you replace the mock API with DroneKit commands connected to AirSim, you
+  see your LangGraph agents control a real (simulated) flying machine for the first
+  time. Any agent logic that was wrong in theory becomes immediately obvious when
+  the drone flies to the wrong location or ignores a waypoint update.
+
+--------------------------------------------------------------------------------
+MODULE 3.3 — MALFUNCTION SIMULATION TESTS
+--------------------------------------------------------------------------------
+  Test M1: Force battery=12% at 500m → handoff triggers → Drone 2 from Station 2
+            [MUST PASS 10/10]
+  Test M2: Disable GPS lock for 4 seconds → malfunction agent detects → handoff
+            [MUST PASS 10/10]
+  Test M3: Inject motor_status=FAILURE → emergency landing + handoff in parallel
+            [MUST PASS 10/10]
+  Test M4: RSSI=-92dBm → agent switches to last-known GPS tracking mode
+            [MUST PASS 10/10]
+  Test M5: Drone 2 must navigate to CURRENT victim position, not stale fault-time GPS
+            [MUST PASS 10/10]
+
+  Run each test 10 times, log results → docs/malfunction_tests.md
+
+WHY THIS MATTERS:
+  When you present to government, the first question after 'does it work' will be
+  'what happens when it fails'. These tests give you a definitive, data-backed answer.
+  Each must be run 10 times — one successful run proves nothing, consistent success
+  across 10 proves robustness.
+
+--------------------------------------------------------------------------------
+MODULE 3.4 — PERFORMANCE BENCHMARKING
+--------------------------------------------------------------------------------
+  B1: SOS-to-airborne time — 10 runs. Target: mean < 90 seconds
+  B2: Malfunction detection to Drone 2 airborne — 10 runs. Target: < 30 seconds
+  B3: Drone-to-victim distance during tracking — 5-minute run. Target: < 5 meters
+  B4: Agent pipeline latency — SOS input to dispatch command. Target: < 10 seconds
+
+  Save all raw data + summary to docs/simulation_benchmarks.md
+
+WHY THIS MATTERS:
+  Numbers are what separate a science project from a product pitch. You cannot say
+  'pretty fast'. You say '67 seconds mean response time, std 8 seconds, 100 trials'.
+  These numbers go directly into your government proposal as Table 1 of evidence.
+
+--------------------------------------------------------------------------------
+PHASE 3 EXIT CRITERIA — ALL MUST PASS BEFORE MOVING TO PHASE 4
+--------------------------------------------------------------------------------
+  [ ] AirSim + PX4 SITL environment fully operational
+  [ ] LangGraph agents connected to DroneKit — not mock API
+  [ ] All 5 malfunction tests (M1–M5) pass with 10/10 success rate over 10 runs each
+  [ ] Moving victim tracked at 60 km/h without losing GPS for > 10 seconds
+  [ ] All 4 performance benchmarks meet targets — results saved to docs/
+
+================================================================================
+PHASE 4 — COMPUTER VISION SCENE INTELLIGENCE
+Duration: Month 7–8
+Goal: Build the AI vision system that analyzes the scene when the drone arrives.
+Your strongest domain — YOLOv8 from NIAR experience applied directly.
+================================================================================
+
+--------------------------------------------------------------------------------
+MODULE 4.1 — SCENE CLASSIFICATION MODEL
+--------------------------------------------------------------------------------
+  - Binary classifier: open area (0) vs enclosed/building (1)
+  - Training data: Google Open Images V7, 5000 outdoor + 5000 building images
+  - Model: MobileNetV3-Small (lightweight, purpose-built for edge devices)
+  - Train: 80/20 split, 20 epochs, Adam lr=1e-4, augmentation (flip, brightness, rotation)
+  - Target: > 92% accuracy, < 15ms inference per frame on Jetson
+  - Save as scene_classifier.pt
+
+WHY THIS MATTERS:
+  The scene classifier makes the first decision on arrival: open ground or building?
+  Open → hover and track. Building → orbit, scan entries, relay exit map to police.
+  Get this wrong and the drone uses the wrong strategy for the environment.
+
+--------------------------------------------------------------------------------
+MODULE 4.2 — BUILDING ENTRY/EXIT DETECTION
+--------------------------------------------------------------------------------
+  - Collect and annotate training images: doors, gates, windows, stairwells
+  - Annotate in Roboflow (free tier) — export in YOLOv8 bounding box format
+  - Train YOLOv8-nano: 50 epochs, img size 640
+  - Target: mAP@0.5 > 0.72
+  - Orbital scan behavior when building detected:
+    1. Increase altitude to 15m for overview
+    2. Perform 360-degree slow orbit at fixed radius
+    3. Detect and GPS-tag all visible doors, gates, ground-floor windows
+    4. Transmit entry/exit map to management dashboard in real time
+
+WHY THIS MATTERS:
+  An officer who enters a building without knowing all exits is at risk of ambush.
+  Your drone maps every visible door, gate, and window and transmits GPS coordinates
+  to police before they arrive. This changes blind tactical entry into coordinated
+  approach. Most visually impressive feature for government demonstration.
+
+--------------------------------------------------------------------------------
+MODULE 4.3 — PERSON DETECTION AND TRACKING
+--------------------------------------------------------------------------------
+  - Deploy YOLOv8-medium for person detection (pretrained COCO weights — no retraining)
+  - Install ByteTrack: maintains persistent person IDs through occlusions
+  - ByteTracker config: max_age=30, min_hits=3, iou_threshold=0.3
+  - Victim identification: person whose GPS best matches watch GPS at drone arrival
+  - Behavior analysis: flag rapid approach to victim, restraining motion as suspect
+  - Stream all bounding boxes, IDs, and role labels to dashboard via WebSocket
+
+WHY THIS MATTERS:
+  When drone arrives, there may be multiple people: victim, threat actor, bystanders.
+  System must identify which one is the victim and track all persistently. ByteTrack
+  maintains IDs even when someone ducks behind a car and reappears — same tracking ID.
+  This is what makes the video feed actionable intelligence, not just confusing footage.
+
+--------------------------------------------------------------------------------
+MODULE 4.4 — NIGHT VISION AND LOW-LIGHT MODE
+--------------------------------------------------------------------------------
+  - Detect ambient light from RealSense color stream mean brightness
+  - Automatic switch: if mean brightness < 40 lux → activate IR depth mode
+  - Apply CLAHE enhancement to low-light RGB frames before running YOLO detection
+  - Test in simulated dark conditions: person detection accuracy must remain > 80%
+
+WHY THIS MATTERS:
+  Most assaults happen at night. A drone that only works in daylight is not a safety
+  system — it is a daylight demonstration. The RealSense D435i has active IR sensing
+  that works in complete darkness. Without this module: 12-hour gap in coverage daily.
+
+--------------------------------------------------------------------------------
+MODULE 4.5 — JETSON ORIN NANO OPTIMIZATION
+--------------------------------------------------------------------------------
+  - Install JetPack SDK (Ubuntu 22.04 base, includes CUDA and TensorRT)
+  - Export scene classifier to TensorRT FP16 engine
+  - Export YOLOv8-nano (building detection) to TensorRT INT8 engine
+  - Export YOLOv8-medium (person tracking) to TensorRT FP16 engine
+  - Benchmark full pipeline on Jetson: target 30 FPS simultaneous inference
+  - Implement GPU temperature monitor: throttle to 20 FPS if GPU temp > 80°C
+  - Commit all TensorRT engine files to /vision/engines/
+
+WHY THIS MATTERS:
+  Running 3 neural networks simultaneously needs efficient CUDA usage. Without
+  TensorRT, 30 FPS pipeline becomes 7 FPS slideshow — person tracking becomes
+  unusable. TensorRT gives 3–4x speedup on Jetson hardware specifically.
+
+--------------------------------------------------------------------------------
+PHASE 4 EXIT CRITERIA — ALL MUST PASS BEFORE MOVING TO PHASE 5
+--------------------------------------------------------------------------------
+  [ ] Scene classifier > 92% accuracy, < 15ms inference per frame on Jetson
+  [ ] Building entry/exit detection mAP@0.5 > 0.72 on validation set
+  [ ] Person tracking maintains IDs through 30-second video clips with occlusions
+  [ ] Full vision pipeline at 30 FPS on Jetson Orin Nano
+  [ ] Night mode operational — person detection > 80% in low-light test
+  [ ] All TensorRT engines committed to /vision/engines/
+
+================================================================================
+PHASE 5 — HARDWARE ASSEMBLY AND INTEGRATION
+Duration: Month 9–10
+Goal: Assemble the physical drone and integrate all software onto real hardware.
+By this phase, every algorithm is proven in simulation. This phase makes proven
+software run on physical components — not about figuring out the AI.
+================================================================================
+
+--------------------------------------------------------------------------------
+MODULE 5.1 — DRONE FRAME ASSEMBLY
+--------------------------------------------------------------------------------
+  - Read Holybro X500 V2 assembly guide completely before touching components
+  - Assemble frame: top plate, bottom plate, 4 arms in correct orientation
+  - Mount motors: verify CW/CCW rotation direction per diagram (alternating pattern)
+  - Solder motor wires to ESCs — heat-shrink all joints, no exposed copper
+  - Install power distribution board — measure voltage at each ESC before battery
+  - Perform weight balance: center of gravity within 1cm of geometric center
+  - Mount propellers ONLY as final step before first flight — NEVER earlier
+
+WHY THIS MATTERS:
+  Assembling yourself gives complete mechanical understanding. Weight balance is
+  critical: off-center CoG drains battery 20% faster and is unstable in wind.
+
+--------------------------------------------------------------------------------
+MODULE 5.2 — PIXHAWK 6C CALIBRATION (5 STEPS — IN ORDER)
+--------------------------------------------------------------------------------
+  - Flash latest stable PX4 firmware using QGroundControl
+  - Calibration 1: Accelerometer — 6 orientations on flat surface
+  - Calibration 2: Compass — figure-8 rotation outdoors away from metal
+  - Calibration 3: ESC — all 4 ESCs synchronized simultaneously
+  - Calibration 4: Radio — RC transmitter range calibration for safety override
+  - Calibration 5: Level horizon — sets true level reference for flight controller
+
+  Safety parameters:
+  - Max altitude: 120m (legal limit)
+  - RTL battery threshold: 20%
+  - Geofence: enabled (200m radius)
+  - MAVLink baud 921600 on UART/TELEM2 → connected to Jetson
+
+WHY THIS MATTERS:
+  An uncalibrated Pixhawk cannot distinguish true horizontal from a tilted surface,
+  cannot read GPS accurately, and cannot synchronize all four motors — leading to
+  unstable hover, drift, and crash. Calibration must be done IN ORDER.
+
+--------------------------------------------------------------------------------
+MODULE 5.3 — JETSON INTEGRATION
+--------------------------------------------------------------------------------
+  - Mount Jetson on payload rail with vibration-dampening foam between mount and frame
+  - Connect Jetson UART to Pixhawk TELEM2 via USB-serial adapter
+  - Flash JetPack 6.0 — includes CUDA, TensorRT, all NVIDIA SDKs
+  - Install all Python dependencies from requirements.txt on Jetson
+  - Copy TensorRT vision engine files to /models/ on Jetson
+  - Create guardian-agent.service systemd unit — auto-starts on boot, auto-restarts on crash
+  - Insert LTE SIM, test cellular data, ping cloud backend — verify latency < 100ms
+
+WHY THIS MATTERS:
+  Vibration-dampening foam is not optional — flight vibrations cause persistent
+  noise in IMU readings. The systemd service ensures agent software starts
+  automatically on boot — no engineer SSH-ing in manually for a real deployment.
+
+--------------------------------------------------------------------------------
+MODULE 5.4 — BENCH TESTING (NO PROPELLERS)
+--------------------------------------------------------------------------------
+  - Power full system from LiPo battery: drone + Jetson + camera + LTE
+  - Verify Jetson boots, systemd service starts, DroneKit connects to Pixhawk
+  - Run mock SOS trigger: full agent pipeline executes → MAVLink → Pixhawk acknowledges
+  - Verify RealSense video stream reaches dashboard within 2-second LTE latency
+  - Verify telemetry logged to cloud PostgreSQL database
+  - Run 30-minute continuous bench test: monitor GPU temperature + battery drain rate
+
+WHY THIS MATTERS:
+  Bench test is last chance to find problems for free. Every bug on the bench costs
+  nothing. Same bug at 30 meters altitude costs a crashed drone and ~$1,000.
+  30-minute run specifically tests for thermal throttling before first flight.
+
+--------------------------------------------------------------------------------
+MODULE 5.5 — OUTDOOR FLIGHT TESTS (RECORD ALL ON VIDEO)
+--------------------------------------------------------------------------------
+  PRE-FLIGHT SAFETY CHECKLIST (before EVERY flight — NON-NEGOTIABLE):
+  [ ] Props checked: no cracks, firmly attached
+  [ ] Battery > 80%
+  [ ] GPS: minimum 8 satellites before arming
+  [ ] Area clear of people within 100m radius
+  [ ] Spotter present and briefed
+  [ ] Wind < 15 km/h
+  [ ] FAA/DGCA flight notice filed for test location
+
+  Flight F1: Manual hover at 5m for 60 seconds — verify stable, no drift [RECORD]
+  Flight F2: GPS waypoint 50m away — verify autonomous navigation [RECORD]
+  Flight F3: Return-to-launch — verify autonomous return and precision landing [RECORD]
+  Flight F4: Vision active at 10m — verify live video on dashboard with person detection [RECORD]
+  Flight F5: Full SOS sequence — watch trigger → launch → navigate → hover → dashboard live [RECORD]
+  Flight F6: Simulated mid-flight fault → emergency landing → agent notification [RECORD]
+
+WHY THIS MATTERS:
+  Recording every test flight is not optional. These videos are your proof of concept
+  for government meetings — an official watching autonomous SOS response is convinced
+  in 60 seconds in a way that 60 pages of text cannot achieve.
+
+  SAFETY RULES — NON-NEGOTIABLE:
+  - Never fly over people
+  - Always have a spotter
+  - Stay below 120m altitude
+  - File FAA/DGCA flight notice before every outdoor test
+  - Carry fire extinguisher during all LiPo battery charging
+  - Never leave batteries unattended while charging
+  - Charge batteries in fireproof LiPo bags
+
+--------------------------------------------------------------------------------
+PHASE 5 EXIT CRITERIA — ALL MUST PASS BEFORE MOVING TO PHASE 6
+--------------------------------------------------------------------------------
+  [ ] All hardware assembled, weight-balanced, and bench-validated
+  [ ] All 5 Pixhawk calibrations complete — drone hovers stably in GPS hold mode
+  [ ] Bench test pass: full agent pipeline executes on real hardware without errors
+  [ ] All 6 outdoor flight tests complete — every test recorded on video
+  [ ] 30-minute continuous operation without thermal throttling or hardware fault
+  [ ] All test videos saved to docs/flight_tests/
+
+================================================================================
+PHASE 6 — FULL INTEGRATION AND GOVERNMENT PRESENTATION
+Duration: Month 11–12
+Goal: Build management dashboard, run controlled tests, prepare government
+      proposal package that turns prototype into approved deployment.
+================================================================================
+
+--------------------------------------------------------------------------------
+MODULE 6.1 — MANAGEMENT DASHBOARD
+--------------------------------------------------------------------------------
+  Frontend: React + TypeScript + Mapbox GL
+    - Live map: drone position icon, victim pin, station markers
+    - Live video panel: RealSense stream with YOLO overlays (person boxes,
+      entry/exit markers, threat labels)
+    - Mission timeline: SOS trigger → dispatch → arrival → police arrival → close
+    - Telemetry panel: battery%, altitude, speed, GPS lock, signal — every 500ms
+    - Alert panel: malfunction events, handoff events, status changes with timestamps
+    - Incident log: searchable table of all past missions, exportable PDF report
+
+  Backend: FastAPI WebSocket server — pushes all real-time events to dashboard
+
+WHY THIS MATTERS:
+  Without the dashboard, the drone is flying and gathering data that nobody can act
+  on. With it, a police officer at headquarters sees the victim's location, drone
+  position, live AI-overlaid video, and building entry map — before the police car
+  leaves the station. This is also your primary demonstration tool for government.
+
+--------------------------------------------------------------------------------
+MODULE 6.2 — WATCH COMPANION APP
+--------------------------------------------------------------------------------
+  - Wear OS app (Android Studio): background service for continuous biometric collection
+  - Run ONNX danger model locally — inference every 5 seconds without cloud dependency
+  - Haptic feedback: double-buzz on score 50–70 (uncertain range)
+  - 10-second dismiss window: double-tap to cancel if user knows she is safe
+  - Auto-SOS: encrypted danger payload sent to cloud if score > 70 for 15 seconds
+  - Safe zone management: long-press to mark current GPS as trusted safe zone
+  - Emergency contact list: notified simultaneously with police — not after
+
+WHY THIS MATTERS:
+  The watch app is the only piece the end user actually touches. If it false-alarms
+  constantly, women will remove it and the system becomes useless. The dismiss window
+  signals that the system respects user judgment — critical for adoption.
+
+--------------------------------------------------------------------------------
+MODULE 6.3 — CONTROLLED END-TO-END TESTS (RECORD ALL WITH TIMESTAMPS)
+--------------------------------------------------------------------------------
+  Test E1: Static victim — SOS → dispatch → drone arrives within 3 min →
+           scene analysis → dashboard complete [RECORD WITH TIMESTAMP]
+  Test E2: Moving victim at 30 km/h — drone tracks, GPS never lost > 10s
+           [RECORD WITH TIMESTAMP]
+  Test E3: Building scene — drone orbits test building, detects 3 doors,
+           transmits GPS-tagged entry map [RECORD WITH TIMESTAMP]
+  Test E4: Malfunction mid-flight → handoff → Drone 2 continues without coverage gap
+           [RECORD WITH TIMESTAMP]
+  Test E5: Night scenario — low-light mode activates automatically, person detected in IR
+           [RECORD WITH TIMESTAMP]
+
+  Save all 5 videos to docs/demo_videos/ — go directly into government proposal.
+
+WHY THIS MATTERS:
+  These tests are your proof-of-concept evidence — equivalent of a clinical trial.
+  You cannot present to government without them. Each test recorded with visible
+  timestamps so officials can see footage is authentic and unedited.
+
+--------------------------------------------------------------------------------
+MODULE 6.4 — GOVERNMENT PROPOSAL PACKAGE
+--------------------------------------------------------------------------------
+  Section 1 — Executive Summary: NCRB statistics, solution, response time improvement
+  Section 2 — Technical Architecture: full system diagram, components, data flow
+  Section 3 — Prototype Evidence: benchmark tables, video links, live demo offer
+  Section 4 — Regulatory Compliance:
+    - DGCA Innovation Sandbox application pathway
+    - DPDPA 2023 data privacy compliance (no raw biometrics leave device)
+    - Police MOU template
+  Section 5 — Pilot Proposal: 3 police stations, specific city, 6-month trial,
+    measurable success metrics
+  Section 6 — Cost-Benefit Analysis:
+    $1,230/station vs $50,000+ alternatives, response time improvement, lives saved
+  Section 7 — Partnership Asks:
+    DGCA sandbox approval, pilot city designation, police station access
+
+  Prepare 20-slide presentation deck — one slide per major section — for minister meetings
+
+WHY THIS MATTERS:
+  A working prototype without a compelling proposal does not get government approval.
+  The regulatory compliance section is most critical: showing officials the exact
+  DGCA sandbox pathway proves you have done your homework and are asking for
+  something legally achievable. Cost-benefit ($1,230 vs $50,000+) is what finance
+  officials focus on.
+
+--------------------------------------------------------------------------------
+MODULE 6.5 — PATENT FILING
+--------------------------------------------------------------------------------
+  - File provisional patent BEFORE any public demonstration or government presentation
+  - Key claims:
+    1. Biometric autonomous drone dispatch pipeline
+    2. Fault-tolerant multi-drone handoff protocol
+    3. AI scene intelligence for law enforcement coordination
+  - Budget: $1,500–3,000 with patent attorney — non-negotiable
+  - After filing: 12 months patent-pending protection
+  - File non-provisional within this 12-month window
+
+WHY THIS MATTERS:
+  Filing BEFORE any public demonstration is the difference between owning your
+  invention and losing it. Public disclosure starts a 12-month clock after which
+  you permanently lose patent rights in most countries. Without protection, a larger
+  company can observe your government demo and build the same thing.
+
+--------------------------------------------------------------------------------
+PHASE 6 EXIT CRITERIA — ALL MUST PASS
+--------------------------------------------------------------------------------
+  [ ] All 5 controlled tests (E1–E5) pass and recorded on video with timestamps
+  [ ] Management dashboard operational with all panels updating in real time
+  [ ] Watch companion app triggers SOS and drone responds in controlled demo
+  [ ] Government proposal — all 7 sections written and legally reviewed
+  [ ] 20-slide presentation deck ready for ministerial meetings
+  [ ] Provisional patent filed BEFORE any public demonstration
+  [ ] At least 1 government or regulatory meeting formally scheduled
+
+================================================================================
+7. GOVERNMENT APPROVAL PATHWAY
+================================================================================
+
+7.1 WHO TO APPROACH FIRST
+  - Always approach State government before Central — they move faster and have
+    direct ownership of police operations.
+  - State Home Department → Police Headquarters → Smart City Mission office
+  - State Women and Child Development Department
+  - India: approach MeitY Startup Hub for technology sandbox approval
+  - Apply to DGCA Innovation Sandbox — created for accelerating drone startup approvals
+  - Apply to Startup India recognition — reduces regulatory friction
+
+7.2 DGCA REGULATORY REQUIREMENTS (INDIA)
+  - Register drone under Digital Sky Platform (mandatory)
+  - Apply for NSOP (Non-Scheduled Operator Permit) under Category 3 for medium drones
+  - BVLOS (Beyond Visual Line of Sight) waiver required for autonomous dispatch
+  - UAS type certificate required for the specific drone configuration
+  - Data localization: all data must reside on Indian servers (DPDPA 2023)
+  - Recommended first step: DGCA Innovation Sandbox — waives standard approval timeline
+
+7.3 WHAT THE PROTOTYPE MUST DEMONSTRATE TO GOVERNMENT
+  - Live working demo (not slides): SOS trigger → drone dispatch → arrival → scene analysis
+  - Response time data: show 2–3 minute mean response vs 15–30 minute police car
+  - False positive rate: demonstrate < 5% in controlled testing
+  - Data privacy: prove no raw biometric data leaves the user's device
+  - Safety record: zero hardware incidents across all prototype tests
+  - Cost: $1,230 per station vs $50,000+ for conventional alternatives
+
+================================================================================
+8. RISK REGISTER
+================================================================================
+
+Risk                            Probability  Impact    Mitigation
+---------------------------------------------------------------------------
+False positive triggers panic   Medium       High      Multi-signal gate + 15s duration + dismiss
+GPS fails in urban canyon       Medium       Medium    Cell tower triangulation + BLE fallback
+DGCA regulatory delay > 6 mo   High         High      Apply DGCA sandbox at Phase 4 start
+LiPo battery fire during charge Low          Very High Fireproof bags, monitored charging, never unattended
+Drone GPS spoofing / jamming    Low          Very High Encrypted MAVLink, signed firmware, multi-constellation GPS
+Biometric data privacy breach   Low          Very High Edge-only inference — no raw biometrics to cloud
+Solo developer bottleneck Ph5   High         Medium    Recruit hardware co-developer at Phase 4 completion
+
+================================================================================
+END OF DOCUMENT
+Guardian Drone System — Project Document v2.0
+Chikku (Akhileswar Pathinavalasa)
+Every module has a purpose. Read the WHY column.
+================================================================================
