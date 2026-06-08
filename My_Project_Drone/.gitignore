@@ -31,14 +31,15 @@ data/raw/
 data/processed/
 data/features/
 
-# Models — large binary files, commit to Git LFS or docs only
+# Models — large binary files, not committed (too large for GitHub)
 *.pt
 *.pth
 *.onnx
 *.pkl
 *.engine
-biometric_ml/models/
 vision/engines/
+# Keep the models directory itself tracked
+!biometric_ml/models/.gitkeep
 
 # Logs
 *.log
