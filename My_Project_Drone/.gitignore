@@ -1,0 +1,64 @@
+# Environment — only the real secrets file, NOT .env.example
+.env
+*.env
+# Allow the example template
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Conda / venv
+env/
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data — raw datasets are large, never commit them
+data/raw/
+data/processed/
+data/features/
+
+# Models — large binary files, commit to Git LFS or docs only
+*.pt
+*.pth
+*.onnx
+*.pkl
+*.engine
+biometric_ml/models/
+vision/engines/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# QGroundControl / AirSim
+*.params
+*.ulg
+AirSim/
+
+# LiPo / hardware notes with sensitive info
+hardware/serial_numbers.txt
