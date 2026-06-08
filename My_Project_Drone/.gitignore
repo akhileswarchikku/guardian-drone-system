@@ -40,6 +40,9 @@ data/features/
 vision/engines/
 # Keep the models directory itself tracked
 !biometric_ml/models/.gitkeep
+# Phase 1.8 exported deployment models — small enough to commit (< 1MB each)
+!biometric_ml/models/danger_lstm.onnx
+!biometric_ml/models/danger_lstm_int8.pt
 
 # Logs
 *.log
