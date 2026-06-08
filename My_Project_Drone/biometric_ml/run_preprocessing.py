@@ -82,7 +82,7 @@ def run_all_subjects(force: bool = False) -> tuple[np.ndarray, np.ndarray, list]
         subject_ids=np.array(all_ids, dtype=np.int32),
         feature_names=np.array(FEATURE_NAMES),
     )
-    print(f"\n  Combined dataset saved → {combined_path}")
+    print(f"\n  Combined dataset saved -> {combined_path}")
     return X_all, y_all, all_ids
 
 

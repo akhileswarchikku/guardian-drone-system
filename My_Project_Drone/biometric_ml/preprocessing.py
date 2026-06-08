@@ -25,6 +25,9 @@ from scipy.stats import linregress
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
+# np.trapz was removed in NumPy 2.0; np.trapezoid is the replacement.
+_trapz = getattr(np, "trapezoid", None) or np.trapz
+
 # ── sampling rates ───────────────────────────────────────────────────────────
 FS_BVP   = 64     # Hz
 FS_EDA   = 4      # Hz
@@ -90,29 +93,36 @@ def lowpass_filter(
 # 2.  HRV FEATURE EXTRACTION  (from BVP at 64 Hz)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _compute_lf_hf(peaks: np.ndarray, rr: np.ndarray) -> float:
+def _compute_lf_hf(beat_times: np.ndarray, rr: np.ndarray) -> float:
     """
     LF/HF ratio via Welch PSD on RR intervals interpolated to 4 Hz.
     LF: 0.04–0.15 Hz  |  HF: 0.15–0.40 Hz
+
+    Parameters
+    ----------
+    beat_times : seconds of the beat that STARTS each RR interval (len = len(rr))
+    rr         : valid inter-beat intervals in seconds (already physiologically filtered)
     """
     try:
-        peak_times = peaks[1:] / float(FS_BVP)          # seconds
-        fs_interp  = 4.0
-        t_uniform  = np.arange(peak_times[0], peak_times[-1], 1.0 / fs_interp)
+        if len(rr) < 4:
+            return 0.0
+        fs_interp = 4.0
+        t_uniform = np.arange(beat_times[0], beat_times[-1], 1.0 / fs_interp)
         if len(t_uniform) < 8:
             return 0.0
 
-        fn       = interp1d(peak_times, rr, kind="cubic",
+        fn       = interp1d(beat_times, rr, kind="cubic",
                             bounds_error=False, fill_value="extrapolate")
         rr_uni   = fn(t_uniform)
         nperseg  = min(len(rr_uni), 64)
         freqs, psd = welch(rr_uni, fs=fs_interp, nperseg=nperseg)
 
-        lf = float(np.trapz(psd[(freqs >= 0.04) & (freqs < 0.15)],
-                            freqs[(freqs >= 0.04) & (freqs < 0.15)]))
-        hf = float(np.trapz(psd[(freqs >= 0.15) & (freqs <= 0.40)],
-                            freqs[(freqs >= 0.15) & (freqs <= 0.40)]))
-        return lf / hf if hf > 1e-10 else 0.0
+        lf = float(_trapz(psd[(freqs >= 0.04) & (freqs < 0.15)],
+                          freqs[(freqs >= 0.04) & (freqs < 0.15)]))
+        hf = float(_trapz(psd[(freqs >= 0.15) & (freqs <= 0.40)],
+                          freqs[(freqs >= 0.15) & (freqs <= 0.40)]))
+        # Clip at 20 to guard against near-zero HF (physiological range ≈ 0.5–20)
+        return min(lf / hf, 20.0) if hf > 1e-10 else 0.0
     except Exception:
         return 0.0
 
@@ -127,17 +137,44 @@ def extract_hrv_features(bvp_window: np.ndarray) -> dict:
     """
     Extract 6 HRV features from one 30-second BVP window (64 Hz).
     Returns zero dict on failure (too few peaks / flat signal).
+
+    Notes
+    -----
+    The Empatica E4 BVP signal can be inverted (troughs, not peaks) depending
+    on the recording. We try both orientations and keep whichever yields more
+    physiologically valid RR intervals (0.3–2.0 s, i.e. 30–200 bpm).
+    BVP is normalised to zero-mean unit-std before peak detection so that the
+    height threshold is independent of signal amplitude.
     """
     bvp = bandpass_filter(bvp_window.flatten(), 0.5, 4.0, FS_BVP)
 
-    # Peak detection: min 0.3 s apart (200 bpm upper bound)
-    min_dist = int(0.3 * FS_BVP)
-    peaks, _ = find_peaks(bvp, distance=min_dist, prominence=0.2)
-    if len(peaks) < 3:
+    # Normalise: zero-mean unit-std removes amplitude dependency
+    bvp_std = np.std(bvp)
+    if bvp_std < 1e-6:
         return _HRV_ZERO.copy()
+    bvp_n = (bvp - np.mean(bvp)) / bvp_std
 
-    rr = np.diff(peaks) / float(FS_BVP)          # inter-beat intervals in seconds
-    rr = rr[(rr >= 0.3) & (rr <= 2.0)]           # physiologically valid (30–200 bpm)
+    min_dist = int(0.3 * FS_BVP)   # 0.3 s → 200 bpm upper bound
+
+    def _detect(sig):
+        peaks, _ = find_peaks(sig, distance=min_dist, height=0.3)
+        if len(peaks) < 3:
+            return peaks, np.array([]), np.array([])
+        rr_all   = np.diff(peaks) / float(FS_BVP)
+        valid    = (rr_all >= 0.3) & (rr_all <= 2.0)
+        rr       = rr_all[valid]
+        # time (seconds) of the beat that STARTS each valid RR interval
+        bt_times = peaks[:-1][valid] / float(FS_BVP)
+        return peaks, rr, bt_times
+
+    # Try both orientations; use the one with more valid beats
+    peaks_pos, rr_pos, bt_pos = _detect(bvp_n)
+    peaks_neg, rr_neg, bt_neg = _detect(-bvp_n)
+    if len(rr_pos) >= len(rr_neg):
+        rr, bt = rr_pos, bt_pos
+    else:
+        rr, bt = rr_neg, bt_neg
+
     if len(rr) < 2:
         return _HRV_ZERO.copy()
 
@@ -146,7 +183,7 @@ def extract_hrv_features(bvp_window: np.ndarray) -> dict:
         "hrv_rmssd":   float(np.sqrt(np.mean(rr_diff ** 2))),
         "hrv_sdnn":    float(np.std(rr, ddof=1)),
         "hrv_pnn50":   float(np.mean(np.abs(rr_diff) > 0.05)),
-        "hrv_lf_hf":   _compute_lf_hf(peaks, rr),
+        "hrv_lf_hf":   _compute_lf_hf(bt, rr),
         "hrv_mean_rr": float(np.mean(rr)),
         "hrv_std_rr":  float(np.std(rr, ddof=1)),
     }
@@ -283,13 +320,20 @@ def is_valid_window(
 ) -> bool:
     """
     Return False if:
-      - BVP or EDA has >20% consecutive-identical samples (sensor dropout)
+      - BVP has >20% consecutive-identical samples (cardiac sensor dropout)
       - any array contains NaN or Inf
+
+    Notes
+    -----
+    The flat-ratio check is intentionally applied only to BVP, not EDA.
+    At 4 Hz the EDA signal changes slowly by design; quantisation means many
+    consecutive samples are exactly identical even in normal physiological
+    recordings.  Applying a flat-ratio filter to EDA would incorrectly discard
+    ~90–95% of valid windows (observed on several WESAD subjects).
     """
-    for sig in [bvp_window.flatten(), eda_window.flatten()]:
-        flat_ratio = float(np.mean(np.abs(np.diff(sig)) < 1e-6))
-        if flat_ratio > max_flat_ratio:
-            return False
+    bvp_flat = float(np.mean(np.abs(np.diff(bvp_window.flatten())) < 1e-6))
+    if bvp_flat > max_flat_ratio:
+        return False
 
     for sig in [bvp_window, eda_window, acc_window]:
         if not np.all(np.isfinite(sig)):

@@ -266,9 +266,12 @@ class TestWindowValidation:
         flat = np.zeros(FS_BVP * WINDOW_SEC, dtype=np.float32)
         assert not is_valid_window(flat, make_eda(), make_acc())
 
-    def test_flat_eda_is_rejected(self):
+    def test_flat_eda_is_accepted(self):
+        # EDA at 4 Hz naturally has many consecutive identical values due to
+        # quantisation and slow physiology — the flat-ratio check was removed for
+        # EDA to avoid discarding ~90% of valid windows (e.g. WESAD subject S14).
         flat = np.zeros(FS_EDA * WINDOW_SEC, dtype=np.float32)
-        assert not is_valid_window(make_bvp(), flat, make_acc())
+        assert is_valid_window(make_bvp(), flat, make_acc())
 
     def test_nan_in_bvp_is_rejected(self):
         bvp      = make_bvp()
