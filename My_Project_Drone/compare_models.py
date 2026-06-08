@@ -10,8 +10,15 @@ import json
 from pathlib import Path
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+try:
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+    plt.figure(); plt.close()
+    _INTERACTIVE = True
+except Exception:
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _INTERACTIVE = False
 
 ROOT = Path(__file__).parent
 
@@ -132,3 +139,7 @@ plt.tight_layout()
 out2 = ROOT / "docs" / "model_comparison_prec_rec.png"
 plt.savefig(out2, dpi=150)
 print(f"  Precision/Recall plot saved -> {out2}\n")
+
+if _INTERACTIVE:
+    print("  Displaying plots — close all windows to exit.")
+    plt.show()

@@ -26,8 +26,17 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+# Use interactive backend when running manually; fall back to Agg if no display
+try:
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+    plt.figure()        # test that display works
+    plt.close()
+    _INTERACTIVE = True
+except Exception:
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _INTERACTIVE = False
 import torch
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
@@ -375,7 +384,13 @@ def main() -> None:
     print("\n  Generating plot ...")
     plot_scenarios(ex_res, dist_res)
 
-    print("\n  Done.\n")
+    if _INTERACTIVE:
+        print("  Displaying plot — close the window to exit.\n")
+        plt.show()
+    else:
+        print("  (No display detected — plot saved to docs/scenario_test.png)\n")
+
+    print("  Done.\n")
 
 
 if __name__ == "__main__":
