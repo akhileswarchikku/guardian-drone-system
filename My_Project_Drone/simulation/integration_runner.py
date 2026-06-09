@@ -66,28 +66,30 @@ def _phase_header(label: str) -> None:
 
 # ── Drone flight (pure pymavlink OFFBOARD) ────────────────────────────────────
 
-def _fly_to_victim(target_ned: tuple[float, float], stop_event: threading.Event) -> None:
+def _fly_to_victim(ned_target: list, stop_event: threading.Event) -> None:
     """
-    Fly DRONE_1 via PX4 OFFBOARD to target NED (north_m, east_m) at 10m AGL.
-    Updates target as victim moves (stop_event triggers descent + land).
-    Runs in a daemon thread.
+    Fly DRONE_1 via PX4 OFFBOARD using the shared ned_target list [north, east, z].
+    ned_target is the same list object that the GPS tracking loop updates in main(),
+    so drone waypoint stays in sync with victim movement automatically.
+
+    NOTE: AirSim Blocks world origin is Seattle; Hyderabad GPS → NED = 15M metres.
+    ned_target must contain local AirSim coordinates (e.g. [50, 0, -10]).
     """
     from pymavlink import mavutil
 
-    CONNECT_STR   = "udp:127.0.0.1:14550"
-    CRUISE_ALT_M  = 10.0          # AGL for demo (real mission: 30m)
-    PX4_OFFBOARD  = 6 << 16       # custom_mode = 393216
+    CONNECT_STR  = "udp:127.0.0.1:14550"
+    PX4_OFFBOARD = 6 << 16       # custom_mode = 393216
 
     _state: dict = {"alt": 0.0, "armed": False, "custom_mode": 0}
     _lock  = threading.Lock()
     _stop_stream = threading.Event()
-    _ned_target  = [0.0, 0.0, -CRUISE_ALT_M]   # [north, east, z_ned]
+    _ned_target = ned_target   # shared with GPS tracking loop in main()
 
     try:
         print("  [Drone] Connecting to PX4 SITL (udp:127.0.0.1:14550) ...")
         mav = mavutil.mavlink_connection(CONNECT_STR)
         mav.wait_heartbeat(timeout=20)
-        print(f"  [Drone] Heartbeat  sys={mav.target_system}")
+        print(f"  [Drone] Heartbeat  sys={mav.target_system}  target={_ned_target[:2]}")
     except Exception as e:
         print(f"  [Drone] PX4 not reachable ({e}) — skipping flight")
         return
@@ -131,10 +133,8 @@ def _fly_to_victim(target_ned: tuple[float, float], stop_event: threading.Event)
         time.sleep(1)
     print()
 
-    # Set takeoff target before arm
-    vn, ve = target_ned
-    with _lock:
-        _ned_target[:] = [vn, ve, -CRUISE_ALT_M]
+    # ned_target already has z < 0 (climb intent set by main before calling this).
+    # Just wait briefly so stream thread broadcasts a few setpoints before arm.
     time.sleep(0.3)
 
     # Switch to OFFBOARD
@@ -177,14 +177,15 @@ def _fly_to_victim(target_ned: tuple[float, float], stop_event: threading.Event)
         time.sleep(0.3)
 
     # Climb
-    print(f"  [Drone] Climbing to {CRUISE_ALT_M}m AGL ...")
+    cruise_alt = abs(_ned_target[2])
+    print(f"  [Drone] Climbing to {cruise_alt:.0f}m AGL ...")
     t0 = time.time()
     while True:
         with _lock:
             alt   = _state["alt"]
             armed = _state["armed"]
         print(f"  [Drone] alt={alt:5.1f}m", end="\r")
-        if alt >= CRUISE_ALT_M * 0.80:
+        if alt >= cruise_alt * 0.80:
             print(f"\n  [Drone] Reached {alt:.1f}m — en route to victim")
             break
         if not armed:
@@ -196,15 +197,15 @@ def _fly_to_victim(target_ned: tuple[float, float], stop_event: threading.Event)
             break
         time.sleep(0.5)
 
-    # Cruise: track victim GPS until stop_event or arrival
-    print("  [Drone] Tracking victim (updating waypoint every 2s) ...")
+    # Cruise: GPS tracking loop updates _ned_target via ned_target list in main()
+    # Both share the same list object through the closure — no extra sync needed.
+    print("  [Drone] Tracking victim (GPS loop updates waypoint every 1s) ...")
     while not stop_event.is_set():
-        # target_ned is updated externally by the GPS tracking loop
         with _lock:
-            n, e, _ = _ned_target
+            n, e, z = _ned_target
             alt = _state["alt"]
         print(f"  [Drone] flying  NED=({n:.1f},{e:.1f})  alt={alt:.1f}m", end="\r")
-        time.sleep(2.0)
+        time.sleep(1.0)
 
     # Land
     print("\n  [Drone] Descending to land ...")
@@ -238,12 +239,13 @@ def _vision_loop(
     """
     try:
         from vision.scene_classifier import get_classifier
-        from vision.camera_mock import make_frame
+        from vision.camera_mock import CameraMock
     except ImportError as e:
         print(f"  [Vision] Import failed: {e}")
         return
 
-    clf = get_classifier(model_size="n")
+    clf  = get_classifier(model_size="n")
+    mock = CameraMock(scene="distress")
     frame_n = 0
 
     while not stop_event.is_set():
@@ -253,7 +255,7 @@ def _vision_loop(
         frame = airsim_client.get_rgb_frame()
         src   = "AirSim"
         if frame is None:
-            frame = make_frame("distress")
+            frame = mock.next_frame()
             src   = "synthetic"
 
         try:
@@ -353,33 +355,42 @@ def _gps_track_loop(
     drone_ned_getter,
 ) -> None:
     """
-    Every second: read victim GPS → convert to NED → update drone target.
-    Prints victim position and estimated distance to drone.
+    Every second: read victim GPS → compute relative NED movement → nudge drone target.
+    AirSim Blocks is at Seattle; Hyderabad GPS cannot be used as absolute NED.
+    Instead we track victim's movement RELATIVE to start and nudge the local target.
     """
     import math
-    from simulation.environment import gps_to_ned
+
+    # Victim starting GPS (captured once so we track delta movement)
+    start_lat, start_lon = scene.victim_gps()
+    prev_lat,  prev_lon  = start_lat, start_lon
 
     while not stop_event.is_set():
         vlat, vlon = scene.victim_gps()
         alat, alon = scene.attacker_gps()
-        vn, ve, _  = gps_to_ned(vlat, vlon, 0.0)
-        dist_m     = scene.distance_m()
 
-        # Update drone target
+        # Delta movement since last tick (metres)
+        dlat_m = (vlat - prev_lat) * 111_320.0
+        dlon_m = (vlon - prev_lon) * 111_320.0 * math.cos(math.radians(vlat))
+        prev_lat, prev_lon = vlat, vlon
+
+        # Nudge local AirSim drone waypoint by same relative movement
         with ned_lock:
-            ned_target[0] = vn
-            ned_target[1] = ve
+            ned_target[0] += dlat_m   # north
+            ned_target[1] += dlon_m   # east
+            dn, de = ned_target[0], ned_target[1]
 
-        dn, de, dz = drone_ned_getter()
-        drone_dist = math.sqrt((dn - vn)**2 + (de - ve)**2)
+        attacker_dist_m = scene.distance_m()
+        phy_drone_n, phy_drone_e, _ = drone_ned_getter()
+        drone_dist_m = math.sqrt((phy_drone_n - dn)**2 + (phy_drone_e - de)**2)
 
         print(
             f"  [GPS]  victim=({vlat:.5f}, {vlon:.5f})  "
-            f"attacker_dist={dist_m:5.1f}m  "
-            f"drone_dist={drone_dist:6.1f}m NED"
+            f"attacker={attacker_dist_m:5.1f}m away  "
+            f"drone→target={drone_dist_m:6.1f}m"
         )
 
-        if drone_dist < 20:
+        if drone_dist_m < 15:
             print("  [GPS]  *** DRONE ARRIVED AT VICTIM LOCATION ***")
             stop_event.set()
             break
@@ -474,13 +485,15 @@ def main(fly: bool = True) -> None:
     # ── 7. Drone flight ────────────────────────────────────────────────────────
     if fly:
         _phase_header("6/6  DRONE FLIGHT (PX4 OFFBOARD)")
+        print("  Note: AirSim Blocks world = Seattle. Drone flies a local 50m demo")
+        print("  path. Victim GPS (Hyderabad) drives relative waypoint updates.\n")
 
-        from simulation.environment import gps_to_ned
-        vn, ve, _ = gps_to_ned(victim_lat, victim_lon, 0.0)
-        ned_target = [vn, ve, -10.0]   # shared mutable target
+        # Local AirSim demo target — drone starts at origin, flies 50m north.
+        # GPS tracker nudges this by victim's relative movement each second.
+        ned_target = [50.0, 0.0, -10.0]   # shared mutable [north, east, z_ned]
         ned_lock   = threading.Lock()
 
-        # GPS tracking updates ned_target continuously
+        # GPS tracking updates ned_target with relative victim movement
         gps_thread = threading.Thread(
             target=_gps_track_loop,
             args=(scene, ned_target, ned_lock, stop_mission,
@@ -489,8 +502,9 @@ def main(fly: bool = True) -> None:
         )
         gps_thread.start()
 
-        # Flight runs in foreground (blocks until stop_mission set or done)
-        _fly_to_victim((vn, ve), stop_mission)
+        # Flight runs in foreground — passes shared ned_target list so GPS loop
+        # and drone stream thread read/write the same object.
+        _fly_to_victim(ned_target, stop_mission)
 
     else:
         print("  [Drone] --no-fly flag set — skipping PX4 flight")
