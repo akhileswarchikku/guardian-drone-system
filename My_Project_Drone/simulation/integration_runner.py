@@ -114,11 +114,23 @@ def _fly_to_victim(ned_target: list, stop_event: threading.Event) -> None:
 
     threading.Thread(target=_recv, daemon=True).start()
 
-    # Setpoint streamer
+    # EKF warmup — must happen BEFORE stream starts (mirrors fly_test.py).
+    # 25s gives PX4 time to acquire GPS lock and settle EKF.
+    print("  [Drone] EKF warmup 25s (waiting for GPS lock + EKF settle) ...")
+    for i in range(25, 0, -1):
+        print(f"  [Drone]   {i:2d}s ...", end="\r")
+        time.sleep(1)
+    print()
+
+    # Setpoint streamer — started AFTER EKF warmup, initially z=0 (ground hold).
+    # z is updated to cruise altitude right before arming (same pattern as fly_test.py).
+    _stream_z = [0.0]   # mutable so _stream closure can see updates
+
     def _stream():
         while not _stop_stream.is_set():
             with _lock:
-                n, e, z = _ned_target
+                n, e = _ned_target[0], _ned_target[1]
+                z    = _stream_z[0]
             mav.mav.set_position_target_local_ned_send(
                 0, mav.target_system, mav.target_component,
                 mavutil.mavlink.MAV_FRAME_LOCAL_NED,
@@ -130,16 +142,9 @@ def _fly_to_victim(ned_target: list, stop_event: threading.Event) -> None:
 
     threading.Thread(target=_stream, daemon=True).start()
 
-    # EKF warmup
-    print("  [Drone] EKF warmup 10s ...")
-    for i in range(10, 0, -1):
-        print(f"  [Drone]   {i}s ...", end="\r")
-        time.sleep(1)
-    print()
-
-    # ned_target already has z < 0 (climb intent set by main before calling this).
-    # Just wait briefly so stream thread broadcasts a few setpoints before arm.
-    time.sleep(0.3)
+    # Stream at z=0 for 3s so PX4 registers stable setpoints before OFFBOARD switch.
+    print("  [Drone] Setpoints streaming (z=0, 3s warmup before OFFBOARD) ...")
+    time.sleep(3)
 
     # Switch to OFFBOARD
     print("  [Drone] Switching to OFFBOARD ...")
@@ -161,6 +166,12 @@ def _fly_to_victim(ned_target: list, stop_event: threading.Event) -> None:
             _stop_stream.set()
             return
 
+    # Set climb target BEFORE arming — PX4 sees z<0 immediately on arm → flight intent.
+    # (z=0 at arm time → PX4 interprets as no takeoff intent → auto-disarms)
+    cruise_alt = abs(_ned_target[2])   # ned_target[2] = -10.0 → cruise_alt = 10.0
+    _stream_z[0] = -cruise_alt
+    time.sleep(0.3)   # let stream send a few setpoints with climb target
+
     # Arm
     mav.mav.command_long_send(
         mav.target_system, mav.target_component,
@@ -181,7 +192,7 @@ def _fly_to_victim(ned_target: list, stop_event: threading.Event) -> None:
         time.sleep(0.3)
 
     # Climb
-    cruise_alt = abs(_ned_target[2])
+    # cruise_alt is already set above (before arm) — don't redeclare
     print(f"  [Drone] Climbing to {cruise_alt:.0f}m AGL ...")
     t0 = time.time()
     while True:
@@ -201,21 +212,19 @@ def _fly_to_victim(ned_target: list, stop_event: threading.Event) -> None:
             break
         time.sleep(0.5)
 
-    # Cruise: GPS tracking loop updates _ned_target via ned_target list in main()
-    # Both share the same list object through the closure — no extra sync needed.
+    # Cruise: GPS tracking loop updates ned_target[0]/[1] every second.
+    # _stream reads n,e from ned_target and z from _stream_z (held at cruise alt).
     print("  [Drone] Tracking victim (GPS loop updates waypoint every 1s) ...")
     while not stop_event.is_set():
         with _lock:
-            n, e, z = _ned_target
-            alt = _state["alt"]
+            n, e = _ned_target[0], _ned_target[1]
+            alt  = _state["alt"]
         print(f"  [Drone] flying  NED=({n:.1f},{e:.1f})  alt={alt:.1f}m", end="\r")
         time.sleep(1.0)
 
-    # Land
+    # Land — set stream z to 0 so drone descends
     print("\n  [Drone] Descending to land ...")
-    with _lock:
-        n, e, _ = _ned_target
-        _ned_target[:] = [n, e, 0.0]
+    _stream_z[0] = 0.0
     t0 = time.time()
     while True:
         with _lock:
