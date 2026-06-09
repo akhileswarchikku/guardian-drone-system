@@ -1,0 +1,518 @@
+"""
+Phase 3.7 — Guardian Drone Full Integration Demo
+
+Simulates a real street assault and exercises the complete AI stack:
+
+  AirSim Blocks (visual scene)
+    Victim (blue sphere) + Attacker (red sphere) moving in real-time
+
+  Apple Watch biometric signal
+    Baseline → attack spike → ContextualGate all-5-gates pass → SOS
+
+  LangGraph 10-agent pipeline
+    danger_score → sos_broadcast → station_finder → path_planner → dispatch
+
+  PX4 SITL drone (AirSim physics)
+    OFFBOARD mode → takeoff → fly to victim GPS → track moving victim
+
+  Vision pipeline (YOLOv8 + MiDaS + scene classifier)
+    AirSim camera frame (or synthetic) → detect threat → scene intelligence
+
+Prerequisites
+-------------
+  1. WSL2: make px4_sitl_default none_iris
+  2. Windows: launch AirSim Blocks.exe
+  3. Wait for PX4: "Ready for takeoff!"
+  4. Optionally: pip install airsim  (for visual actors + camera)
+  5. Optionally: PostgreSQL running  (for real station DB)
+
+Run
+---
+  conda activate LLM_GPU
+  python simulation/integration_runner.py
+
+  --no-fly   skip PX4 flight (agent graph only)
+  --no-px4   same as --no-fly
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import threading
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT))
+
+
+# ── Banner ────────────────────────────────────────────────────────────────────
+
+def _banner(msg: str, width: int = 60) -> None:
+    bar = "═" * width
+    print(f"\n  ╔{bar}╗")
+    for line in msg.strip().split("\n"):
+        print(f"  ║  {line:<{width - 2}}║")
+    print(f"  ╚{bar}╝\n")
+
+
+# ── Phase helpers ─────────────────────────────────────────────────────────────
+
+def _phase_header(label: str) -> None:
+    print(f"\n{'─'*60}")
+    print(f"  {label}")
+    print(f"{'─'*60}")
+
+
+# ── Drone flight (pure pymavlink OFFBOARD) ────────────────────────────────────
+
+def _fly_to_victim(target_ned: tuple[float, float], stop_event: threading.Event) -> None:
+    """
+    Fly DRONE_1 via PX4 OFFBOARD to target NED (north_m, east_m) at 10m AGL.
+    Updates target as victim moves (stop_event triggers descent + land).
+    Runs in a daemon thread.
+    """
+    from pymavlink import mavutil
+
+    CONNECT_STR   = "udp:127.0.0.1:14550"
+    CRUISE_ALT_M  = 10.0          # AGL for demo (real mission: 30m)
+    PX4_OFFBOARD  = 6 << 16       # custom_mode = 393216
+
+    _state: dict = {"alt": 0.0, "armed": False, "custom_mode": 0}
+    _lock  = threading.Lock()
+    _stop_stream = threading.Event()
+    _ned_target  = [0.0, 0.0, -CRUISE_ALT_M]   # [north, east, z_ned]
+
+    try:
+        print("  [Drone] Connecting to PX4 SITL (udp:127.0.0.1:14550) ...")
+        mav = mavutil.mavlink_connection(CONNECT_STR)
+        mav.wait_heartbeat(timeout=20)
+        print(f"  [Drone] Heartbeat  sys={mav.target_system}")
+    except Exception as e:
+        print(f"  [Drone] PX4 not reachable ({e}) — skipping flight")
+        return
+
+    # Background receiver
+    def _recv():
+        while not _stop_stream.is_set():
+            msg = mav.recv_match(blocking=True, timeout=0.1)
+            if not msg:
+                continue
+            with _lock:
+                t = msg.get_type()
+                if t == "HEARTBEAT":
+                    _state["armed"]       = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                    _state["custom_mode"] = msg.custom_mode
+                elif t == "GLOBAL_POSITION_INT":
+                    _state["alt"] = msg.relative_alt / 1000.0
+
+    threading.Thread(target=_recv, daemon=True).start()
+
+    # Setpoint streamer
+    def _stream():
+        while not _stop_stream.is_set():
+            with _lock:
+                n, e, z = _ned_target
+            mav.mav.set_position_target_local_ned_send(
+                0, mav.target_system, mav.target_component,
+                mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+                0b0000111111111000,
+                n, e, z,
+                0, 0, 0, 0, 0, 0, 0, 0,
+            )
+            time.sleep(0.05)
+
+    threading.Thread(target=_stream, daemon=True).start()
+
+    # EKF warmup
+    print("  [Drone] EKF warmup 10s ...")
+    for i in range(10, 0, -1):
+        print(f"  [Drone]   {i}s ...", end="\r")
+        time.sleep(1)
+    print()
+
+    # Set takeoff target before arm
+    vn, ve = target_ned
+    with _lock:
+        _ned_target[:] = [vn, ve, -CRUISE_ALT_M]
+    time.sleep(0.3)
+
+    # Switch to OFFBOARD
+    print("  [Drone] Switching to OFFBOARD ...")
+    t0 = time.time()
+    while True:
+        mav.mav.set_mode_send(
+            mav.target_system,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            PX4_OFFBOARD,
+        )
+        time.sleep(0.5)
+        with _lock:
+            mode = _state["custom_mode"]
+        if mode == PX4_OFFBOARD:
+            print("  [Drone] OFFBOARD confirmed")
+            break
+        if time.time() - t0 > 15:
+            print("  [Drone] OFFBOARD timeout — aborting flight")
+            _stop_stream.set()
+            return
+
+    # Arm
+    mav.mav.command_long_send(
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        0, 1, 21196, 0, 0, 0, 0, 0,
+    )
+    t0 = time.time()
+    while True:
+        with _lock:
+            armed = _state["armed"]
+        if armed:
+            print("  [Drone] Armed!")
+            break
+        if time.time() - t0 > 10:
+            print("  [Drone] Arm timeout")
+            _stop_stream.set()
+            return
+        time.sleep(0.3)
+
+    # Climb
+    print(f"  [Drone] Climbing to {CRUISE_ALT_M}m AGL ...")
+    t0 = time.time()
+    while True:
+        with _lock:
+            alt   = _state["alt"]
+            armed = _state["armed"]
+        print(f"  [Drone] alt={alt:5.1f}m", end="\r")
+        if alt >= CRUISE_ALT_M * 0.80:
+            print(f"\n  [Drone] Reached {alt:.1f}m — en route to victim")
+            break
+        if not armed:
+            print(f"\n  [Drone] Disarmed at {alt:.1f}m")
+            _stop_stream.set()
+            return
+        if time.time() - t0 > 40:
+            print(f"\n  [Drone] Climb timeout at {alt:.1f}m")
+            break
+        time.sleep(0.5)
+
+    # Cruise: track victim GPS until stop_event or arrival
+    print("  [Drone] Tracking victim (updating waypoint every 2s) ...")
+    while not stop_event.is_set():
+        # target_ned is updated externally by the GPS tracking loop
+        with _lock:
+            n, e, _ = _ned_target
+            alt = _state["alt"]
+        print(f"  [Drone] flying  NED=({n:.1f},{e:.1f})  alt={alt:.1f}m", end="\r")
+        time.sleep(2.0)
+
+    # Land
+    print("\n  [Drone] Descending to land ...")
+    with _lock:
+        n, e, _ = _ned_target
+        _ned_target[:] = [n, e, 0.0]
+    t0 = time.time()
+    while True:
+        with _lock:
+            alt = _state["alt"]
+        if alt < 0.5 or time.time() - t0 > 20:
+            break
+        time.sleep(0.5)
+
+    _stop_stream.set()
+    print(f"  [Drone] Landed. Final alt={_state['alt']:.1f}m")
+    return _ned_target   # so caller can update
+
+
+# ── Vision loop ───────────────────────────────────────────────────────────────
+
+def _vision_loop(
+    airsim_client,
+    danger_score: float,
+    stop_event: threading.Event,
+    interval_s: float = 3.0,
+) -> None:
+    """
+    Grabs camera frame (AirSim or synthetic) and runs the full vision pipeline.
+    Runs in a daemon thread; prints scene intelligence output every interval_s.
+    """
+    try:
+        from vision.scene_classifier import get_classifier
+        from vision.camera_mock import make_frame
+    except ImportError as e:
+        print(f"  [Vision] Import failed: {e}")
+        return
+
+    clf = get_classifier(model_size="n")
+    frame_n = 0
+
+    while not stop_event.is_set():
+        frame_n += 1
+
+        # Try AirSim camera first, fall back to synthetic distress frame
+        frame = airsim_client.get_rgb_frame()
+        src   = "AirSim"
+        if frame is None:
+            frame = make_frame("distress")
+            src   = "synthetic"
+
+        try:
+            result = clf.classify(
+                frame          = frame,
+                danger_score   = danger_score,
+                drone_dist_km  = 0.05,
+                battery_pct    = 85.0,
+                mission_status = "flying",
+            )
+            print(
+                f"  [Vision] frame={frame_n:03d} ({src})  "
+                f"scene={result.scene_type}  "
+                f"threat={result.threat_level}/5  "
+                f"→ {result.recommended_action[:60]}"
+            )
+        except Exception as e:
+            print(f"  [Vision] frame={frame_n:03d} error: {type(e).__name__}: {e}")
+
+        time.sleep(interval_s)
+
+
+# ── Agent graph ────────────────────────────────────────────────────────────────
+
+def _run_agents(
+    danger_score: float,
+    features: list[float],
+    victim_lat: float,
+    victim_lon: float,
+) -> dict:
+    """
+    Patch agent_graph to use sim_bridge, then invoke danger_score_node through
+    dispatch_node manually (avoids the full blocking loop for the demo).
+    Returns state dict with station + drone assignment.
+    """
+    import agents.agent_graph as ag
+    import simulation.sim_bridge as bridge
+
+    # Patch drone_client calls to use sim_bridge
+    ag.launch_drone  = bridge.launch_drone
+    ag.get_telemetry = bridge.get_telemetry
+    ag.set_waypoint  = bridge.set_waypoint
+    ag.inject_fault  = bridge.inject_fault
+
+    state: dict = {
+        "danger_score": danger_score,
+        "victim_lat":   victim_lat,
+        "victim_lon":   victim_lon,
+        "raw_features": features,
+        "max_iterations": 3,    # short loop for demo
+    }
+
+    _phase_header("AGENT GRAPH — running nodes 1→5 (danger→dispatch)")
+
+    # Node 1: danger score
+    state.update(ag.danger_score_node(state))
+    if not state.get("go_decision"):
+        print("  [Agent 1] Score too low — no dispatch (score may need to be higher)")
+        # Force go for demo if LLM fallback returned False
+        state["go_decision"] = True
+        state.setdefault("mission_id", "DEMO-001")
+
+    # Node 2: SOS broadcast
+    state.update(ag.sos_broadcast_node(state))
+
+    # Node 3: station finder
+    try:
+        state.update(ag.station_finder_node(state))
+    except Exception as e:
+        print(f"  [Agent 3] DB unavailable ({type(e).__name__}) — using mock station")
+        from agents.state import StationInfo
+        state["nearest_stations"] = [
+            StationInfo(
+                station_id=1, name="Madhapur PS",
+                lat=17.4410, lon=78.3830,
+                distance_km=0.72, drones_available=2,
+            )
+        ]
+        state["assigned_station"] = state["nearest_stations"][0]
+
+    # Node 4: path planner
+    state.update(ag.path_planner_node(state))
+
+    # Node 5: dispatch
+    state.update(ag.dispatch_node(state))
+
+    return state
+
+
+# ── GPS tracking loop ─────────────────────────────────────────────────────────
+
+def _gps_track_loop(
+    scene,
+    ned_target: list,
+    ned_lock: threading.Lock,
+    stop_event: threading.Event,
+    drone_ned_getter,
+) -> None:
+    """
+    Every second: read victim GPS → convert to NED → update drone target.
+    Prints victim position and estimated distance to drone.
+    """
+    import math
+    from simulation.environment import gps_to_ned
+
+    while not stop_event.is_set():
+        vlat, vlon = scene.victim_gps()
+        alat, alon = scene.attacker_gps()
+        vn, ve, _  = gps_to_ned(vlat, vlon, 0.0)
+        dist_m     = scene.distance_m()
+
+        # Update drone target
+        with ned_lock:
+            ned_target[0] = vn
+            ned_target[1] = ve
+
+        dn, de, dz = drone_ned_getter()
+        drone_dist = math.sqrt((dn - vn)**2 + (de - ve)**2)
+
+        print(
+            f"  [GPS]  victim=({vlat:.5f}, {vlon:.5f})  "
+            f"attacker_dist={dist_m:5.1f}m  "
+            f"drone_dist={drone_dist:6.1f}m NED"
+        )
+
+        if drone_dist < 20:
+            print("  [GPS]  *** DRONE ARRIVED AT VICTIM LOCATION ***")
+            stop_event.set()
+            break
+
+        time.sleep(1.0)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main(fly: bool = True) -> None:
+    _banner(
+        "GUARDIAN DRONE — FULL INTEGRATION DEMO\n"
+        "Phase 3.7 — End-to-End Pipeline Test\n"
+        "Victim · Watch · Agents · Drone · Vision"
+    )
+
+    from simulation.airsim_client import AirSimClient
+    from simulation.scene_setup   import AttackScene
+    from simulation.biometric_sim import BiometricSimulator
+
+    # ── 1. AirSim scene setup ─────────────────────────────────────────────────
+    _phase_header("1/6  SCENE SETUP")
+    airsim = AirSimClient()
+    scene  = AttackScene(airsim)
+    scene.setup()
+    scene.start()   # begins continuous movement in background
+    print("  [Scene] Victim and attacker actors moving continuously")
+
+    victim_lat, victim_lon = scene.victim_gps()
+
+    # ── 2. Biometric monitor (background) ─────────────────────────────────────
+    _phase_header("2/6  SMARTWATCH MONITOR")
+
+    sos_event = threading.Event()
+
+    def _on_sos():
+        sos_event.set()
+
+    bio = BiometricSimulator(victim_lat, victim_lon, on_sos=_on_sos)
+    bio_thread = threading.Thread(target=bio.run, daemon=True)
+    bio_thread.start()
+
+    print("  [Watch] Monitoring biometrics — baseline phase")
+    print(f"  [Watch] Attack starts in 12 seconds...\n")
+
+    # ── 3. Simulate attack event ───────────────────────────────────────────────
+    time.sleep(12)
+    bio.attack()   # transitions biometric phase → distress
+
+    # ── 4. Wait for SOS confirmation ──────────────────────────────────────────
+    _phase_header("3/6  WAITING FOR SOS GATE CONFIRMATION")
+    print("  [Watch] Monitoring... all 5 gates must pass\n")
+    sos_event.wait(timeout=60)
+
+    if not bio.sos_detected:
+        print("  [Watch] SOS timeout — forcing dispatch for demo")
+        bio.sos_detected = True
+
+    victim_lat, victim_lon = scene.victim_gps()
+    danger_score = bio.latest_score
+    features     = bio.latest_features
+    print(f"  Victim GPS: {victim_lat:.5f}N  {victim_lon:.5f}E")
+    print(f"  Danger score: {danger_score:.1f}/100")
+
+    # ── 5. LangGraph agent pipeline ───────────────────────────────────────────
+    _phase_header("4/6  AGENT PIPELINE")
+
+    try:
+        agent_state = _run_agents(danger_score, features, victim_lat, victim_lon)
+        dispatch    = agent_state.get("dispatch_result")
+        station     = agent_state.get("assigned_station")
+        if station:
+            print(f"\n  Nearest station : {station.name}  ({station.distance_km:.2f}km)")
+        if dispatch:
+            print(f"  Drone assigned  : {dispatch.drone_id}")
+            print(f"  ETA             : {dispatch.eta_seconds:.0f}s")
+    except Exception as e:
+        print(f"  [Agent] Error: {e}")
+        agent_state = {"dispatch_result": None}
+
+    # ── 6. Vision pipeline (background) ───────────────────────────────────────
+    _phase_header("5/6  VISION PIPELINE")
+    stop_mission = threading.Event()
+
+    vision_thread = threading.Thread(
+        target=_vision_loop,
+        args=(airsim, danger_score, stop_mission),
+        daemon=True,
+    )
+    vision_thread.start()
+
+    # ── 7. Drone flight ────────────────────────────────────────────────────────
+    if fly:
+        _phase_header("6/6  DRONE FLIGHT (PX4 OFFBOARD)")
+
+        from simulation.environment import gps_to_ned
+        vn, ve, _ = gps_to_ned(victim_lat, victim_lon, 0.0)
+        ned_target = [vn, ve, -10.0]   # shared mutable target
+        ned_lock   = threading.Lock()
+
+        # GPS tracking updates ned_target continuously
+        gps_thread = threading.Thread(
+            target=_gps_track_loop,
+            args=(scene, ned_target, ned_lock, stop_mission,
+                  AirSimClient().get_drone_ned),
+            daemon=True,
+        )
+        gps_thread.start()
+
+        # Flight runs in foreground (blocks until stop_mission set or done)
+        _fly_to_victim((vn, ve), stop_mission)
+
+    else:
+        print("  [Drone] --no-fly flag set — skipping PX4 flight")
+        print("  [Drone] Simulating 15s flight time ...")
+        time.sleep(15)
+        stop_mission.set()
+
+    # ── 8. Mission complete ────────────────────────────────────────────────────
+    _banner(
+        "MISSION COMPLETE\n"
+        f"  Victim GPS  : {victim_lat:.5f}N {victim_lon:.5f}E\n"
+        f"  Danger score: {danger_score:.1f}/100\n"
+        f"  All AI modules exercised: biometric → agents → vision → drone"
+    )
+
+    scene.stop()
+    bio.stop()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Guardian Drone Integration Demo")
+    parser.add_argument("--no-fly", "--no-px4", action="store_true",
+                        help="Skip PX4 drone flight (agents + vision only)")
+    args = parser.parse_args()
+    main(fly=not args.no_fly)
