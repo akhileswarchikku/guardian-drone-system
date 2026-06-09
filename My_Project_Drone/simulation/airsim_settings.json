@@ -1,0 +1,68 @@
+{
+  "SettingsVersion": 1.2,
+  "SimMode": "Multirotor",
+  "ClockSpeed": 1.0,
+  "Vehicles": {
+    "PX4_DRONE_1": {
+      "VehicleType": "PX4Multirotor",
+      "UseSerial": false,
+      "LockStep": true,
+      "UseTcp": true,
+      "TcpPort": 4560,
+      "ControlPortLocal": 14540,
+      "ControlPortRemote": 14580,
+      "LocalHostIp": "127.0.0.1",
+      "Sensors": {
+        "Barometer": { "SensorType": 1, "Enabled": true },
+        "Imu":       { "SensorType": 2, "Enabled": true },
+        "Gps":       { "SensorType": 3, "Enabled": true },
+        "Magnetometer": { "SensorType": 4, "Enabled": true },
+        "DistanceSensor": { "SensorType": 5, "Enabled": true },
+        "Lidar": { "SensorType": 6, "Enabled": false }
+      },
+      "Cameras": {
+        "front_center": {
+          "CaptureSettings": [
+            {
+              "ImageType": 0,
+              "Width": 1280,
+              "Height": 720,
+              "FOV_Degrees": 90,
+              "AutoExposureSpeed": 100,
+              "MotionBlurAmount": 0
+            }
+          ],
+          "X": 0.5, "Y": 0, "Z": -0.1,
+          "Pitch": -15, "Roll": 0, "Yaw": 0
+        },
+        "bottom_center": {
+          "CaptureSettings": [
+            {
+              "ImageType": 0,
+              "Width": 640,
+              "Height": 480,
+              "FOV_Degrees": 90
+            }
+          ],
+          "X": 0, "Y": 0, "Z": -0.5,
+          "Pitch": -90, "Roll": 0, "Yaw": 0
+        }
+      }
+    },
+    "PX4_DRONE_2": {
+      "VehicleType": "PX4Multirotor",
+      "UseSerial": false,
+      "LockStep": true,
+      "UseTcp": true,
+      "TcpPort": 4561,
+      "ControlPortLocal": 14541,
+      "ControlPortRemote": 14581,
+      "LocalHostIp": "127.0.0.1",
+      "X": 5, "Y": 0, "Z": 0
+    }
+  },
+  "SubWindows": [
+    { "WindowID": 0, "CameraName": "front_center", "ImageType": 0, "VehicleName": "PX4_DRONE_1", "Visible": true },
+    { "WindowID": 1, "CameraName": "bottom_center", "ImageType": 0, "VehicleName": "PX4_DRONE_1", "Visible": true }
+  ]
+}
