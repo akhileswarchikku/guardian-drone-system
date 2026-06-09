@@ -42,6 +42,10 @@ import threading
 import time
 from pathlib import Path
 
+# Windows terminals default to cp1252 — force UTF-8 so box/arrow chars print cleanly
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -49,11 +53,11 @@ sys.path.insert(0, str(ROOT))
 # ── Banner ────────────────────────────────────────────────────────────────────
 
 def _banner(msg: str, width: int = 60) -> None:
-    bar = "═" * width
-    print(f"\n  ╔{bar}╗")
+    bar = "=" * width
+    print(f"\n  +{bar}+")
     for line in msg.strip().split("\n"):
-        print(f"  ║  {line:<{width - 2}}║")
-    print(f"  ╚{bar}╝\n")
+        print(f"  |  {line:<{width - 2}}|")
+    print(f"  +{bar}+\n")
 
 
 # ── Phase helpers ─────────────────────────────────────────────────────────────
@@ -225,29 +229,47 @@ def _fly_to_victim(ned_target: list, stop_event: threading.Event) -> None:
     return _ned_target   # so caller can update
 
 
-# ── Vision loop ───────────────────────────────────────────────────────────────
+# ── Vision pipeline ───────────────────────────────────────────────────────────
+
+def _preload_vision():
+    """
+    Load YOLOv8 classifier + CameraMock before the flight window opens.
+    Returns (clf, mock) or (None, None) on failure.
+    Call this in main() before starting flight so the vision thread fires
+    immediately without waiting ~10s for YOLOv8 to load on GPU.
+    """
+    try:
+        from vision.scene_classifier import get_classifier
+        from vision.camera_mock import CameraMock
+        print("  [Vision] Loading YOLOv8n on GPU ...")
+        clf  = get_classifier(model_size="n")
+        mock = CameraMock(scene="distress")
+        print("  [Vision] YOLOv8n ready")
+        return clf, mock
+    except Exception as e:
+        print(f"  [Vision] Pre-load failed: {e}")
+        return None, None
+
 
 def _vision_loop(
     airsim_client,
     danger_score: float,
     stop_event: threading.Event,
+    clf,
+    mock,
     interval_s: float = 3.0,
 ) -> None:
     """
     Grabs camera frame (AirSim or synthetic) and runs the full vision pipeline.
+    clf and mock are pre-loaded by _preload_vision() in main() — thread starts
+    instantly without waiting for model load.
     Runs in a daemon thread; prints scene intelligence output every interval_s.
     """
-    try:
-        from vision.scene_classifier import get_classifier
-        from vision.camera_mock import CameraMock
-    except ImportError as e:
-        print(f"  [Vision] Import failed: {e}")
+    if clf is None:
+        print("  [Vision] Classifier not available — skipping vision loop")
         return
 
-    clf  = get_classifier(model_size="n")
-    mock = CameraMock(scene="distress")
     frame_n = 0
-
     while not stop_event.is_set():
         frame_n += 1
 
@@ -270,7 +292,7 @@ def _vision_loop(
                 f"  [Vision] frame={frame_n:03d} ({src})  "
                 f"scene={result.scene_type}  "
                 f"threat={result.threat_level}/5  "
-                f"→ {result.recommended_action[:60]}"
+                f"-> {result.recommended_action[:60]}"
             )
         except Exception as e:
             print(f"  [Vision] frame={frame_n:03d} error: {type(e).__name__}: {e}")
@@ -421,8 +443,10 @@ def main(fly: bool = True) -> None:
 
     victim_lat, victim_lon = scene.victim_gps()
 
-    # ── 2. Biometric monitor (background) ─────────────────────────────────────
+    # ── 2. Pre-load vision model (before biometric wait so GPU warms up) ─────────
     _phase_header("2/6  SMARTWATCH MONITOR")
+    print("  [Vision] Pre-loading YOLOv8n while waiting for attack signal ...")
+    clf, mock = _preload_vision()
 
     sos_event = threading.Event()
 
@@ -475,9 +499,10 @@ def main(fly: bool = True) -> None:
     _phase_header("5/6  VISION PIPELINE")
     stop_mission = threading.Event()
 
+    # clf and mock were pre-loaded in step 2 — thread starts immediately
     vision_thread = threading.Thread(
         target=_vision_loop,
-        args=(airsim, danger_score, stop_mission),
+        args=(airsim, danger_score, stop_mission, clf, mock),
         daemon=True,
     )
     vision_thread.start()
@@ -508,8 +533,8 @@ def main(fly: bool = True) -> None:
 
     else:
         print("  [Drone] --no-fly flag set — skipping PX4 flight")
-        print("  [Drone] Simulating 15s flight time ...")
-        time.sleep(15)
+        print("  [Drone] Simulating 30s flight time (3x vision frames expected) ...")
+        time.sleep(30)
         stop_mission.set()
 
     # ── 8. Mission complete ────────────────────────────────────────────────────
