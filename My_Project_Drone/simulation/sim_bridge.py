@@ -25,6 +25,11 @@ Connection ports (matches airsim_settings.json)
   Drone 1 MAVLink GCS port : udp:127.0.0.1:14550
   Drone 2 MAVLink GCS port : udp:127.0.0.1:14551
   AirSim API port          : 41451 (default)
+
+AirSim Blocks.exe location (this machine)
+------------------------------------------
+  C:/Users/akhil/Documents/AirSim/Blocks/Blocks/WindowsNoEditor/Blocks/Binaries/Win64/Blocks.exe
+  AirSim settings.json: C:/Users/akhil/Documents/AirSim/settings.json  (auto-loaded by Blocks)
 """
 from __future__ import annotations
 
@@ -300,5 +305,7 @@ if __name__ == "__main__":
         print("  2. In WSL2: cd ~/PX4-Autopilot && make px4_sitl_default none_iris")
         print("  3. Wait for PX4 to print 'Ready for takeoff'")
         print("  4. Then run this script again")
+        print("  Blocks.exe: C:/Users/akhil/Documents/AirSim/Blocks/Blocks/WindowsNoEditor/Blocks/Binaries/Win64/Blocks.exe")
+        print("  settings.json: C:/Users/akhil/Documents/AirSim/settings.json")
     finally:
         disconnect_all()
