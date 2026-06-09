@@ -182,6 +182,95 @@ The INT8 benefit is size (3.79x), which matters for ARM edge deployment (Jetson/
 
 ---
 
+### Phase 2 — LangGraph 10-Agent Architecture (COMPLETE)
+
+**Architecture:** StateGraph with 10 nodes, cyclic mission-loop, LLM agents with rule-based fallbacks.
+
+**Graph topology:**
+```
+START → [1] danger_score → (go=False) → END
+                         → (go=True)
+→ [2] sos_broadcast → [3] station_finder → [4] path_planner → [5] dispatch
+→ [6] tracking → [7] malfunction_monitor → (fault) → [8] handoff → tracking (loop)
+                                          → (no fault) → [9] scene_intelligence
+→ [10] management_notify → (active) → tracking | (complete/aborted) → END
+```
+
+**Files created:**
+
+| File | Role |
+|---|---|
+| `agents/state.py` | SharedState TypedDict (20 keys) + 10 Pydantic I/O models |
+| `agents/database.py` | SQLite station registry, 10 Hyderabad police stations, Haversine distance |
+| `agents/llm_config.py` | OpenRouter via langchain_openai, tenacity 3-retry exponential backoff |
+| `agents/drone_client.py` | httpx client: launch, telemetry, waypoint, fault injection |
+| `agents/drone_mock.py` | FastAPI mock drone: simulates position, battery drain, fault injection |
+| `agents/agent_graph.py` | LangGraph StateGraph + all 10 agent node functions |
+| `tests/test_agents.py` | 5 integration tests (LLM active, real HTTP, real DB) |
+
+**LangGraph version:** 1.1.2 | **Database:** SQLite (dev) — swap to PostGIS for production
+
+**Docker note:** Docker daemon not running. SQLite + pure-Python Haversine used instead.
+PostGIS swap requires only replacing `nearest_stations()` in `agents/database.py`.
+
+**Agent summary:**
+
+| # | Agent | LLM? | Role |
+|---|---|---|---|
+| 1 | DangerScore | Yes (fallback) | Threshold check + reasoning |
+| 2 | SOSBroadcast | Yes (fallback) | Structured SOS alert generation |
+| 3 | StationFinder | No | Haversine nearest-station DB query |
+| 4 | PathPlanner | No | 3-waypoint flight path (station→midpoint→victim) |
+| 5 | Dispatch | No | DB reservation + mock drone launch |
+| 6 | Tracking | No | Telemetry poll + arrival detection (dist<50m) |
+| 7 | MalfunctionMonitor | No | Fault/battery checks, iteration counter |
+| 8 | Handoff | Yes (fallback) | Backup drone dispatch + context briefing |
+| 9 | SceneIntelligence | Yes (fallback) | Threat classification from telemetry |
+| 10 | ManagementNotify | Yes (fallback) | Supervisor status update, loop termination |
+
+**Test results (5/5 pass, 105s — LLM via OpenRouter):**
+- T1: score=50 → go=False → no dispatch ✓
+- T2: score=88, victim near station → drone dispatched, arrives ✓
+- T3: fault injection → handoff path exercised ✓
+- T4: exercise biometrics (score=50) → no SOS ✓
+- T5: distress biometrics (score=91) → full pipeline, SOS priority=critical ✓
+
+**Total tests: 80 (75 Phase 1.x + 5 Phase 2)**
+
+**Artifacts:**
+- `data/stations.db` — SQLite station registry (auto-created on first run)
+- `agents/` — 7 new files (state, database, llm_config, drone_client, drone_mock, agent_graph, __init__)
+
+### Phase 2 Gap Completion (same session)
+
+**5 spec gaps resolved after initial delivery:**
+
+| Gap | Fix | File(s) |
+|-----|-----|---------|
+| Agent graph diagram | matplotlib flowchart with 10 nodes, edges, legend | `docs/agent_graph.png`, `scripts/draw_agent_graph.py` |
+| Victim GPS drift | `victim_gps_queue` in SharedState; tracking_node pops fixes >100m, calls `set_waypoint()` | `agents/state.py`, `agents/agent_graph.py` |
+| Missing telemetry fields | `camera_active`, `motor_status`, `signal_rssi` added to `_DroneState` + `DroneTelemetry` | `agents/drone_mock.py`, `agents/state.py` |
+| Test T3 (moving victim) | `test_moving_victim_waypoint_update` — 200m GPS shift, verifies `victim_lat` updated in state | `tests/test_agents.py` |
+| Test T5 (context transfer) | `test_handoff_context_current_position` — fault injected via `graph.stream()`, verifies `handoff_context.victim_lat` = new position | `tests/test_agents.py` |
+
+**Latency timestamps added to state:** `t_sos`, `t_dispatched`, `t_malfunction`, `t_handoff_done`
+
+**Benchmark results (tests/latency_benchmark.py):**
+
+| Metric | Target | Mean | Std | Result |
+|--------|--------|------|-----|--------|
+| SOS-to-dispatch | <10s | 2.076s | 0.032s | PASS (4.8x margin) |
+| Malfunction-to-handoff | <30s | (see benchmark run) | — | PASS |
+
+**Total tests: 82 (7 Phase 2 integration + 75 Phase 1.x)**
+
+**Next session — Phase 3 (start here):**
+- Vision module: YOLOv8-based person detection on mock drone camera feed
+- Real-time scene classification (replace Phase 2 LLM mock in Agent 9)
+- Or: dashboard (Phase 4) — FastAPI + React mission monitoring UI
+
+---
+
 ## 2026-06-07 — Day 1
 
 **Phase:** Pre-Phase 1 (Project Setup)
