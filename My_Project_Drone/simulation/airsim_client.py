@@ -95,17 +95,36 @@ class AirSimClient:
         Return latest RGB frame from the drone camera as a BGR numpy array
         (OpenCV convention).  Returns None if AirSim unavailable or no cameras
         configured in settings.json.
+
+        compress=True  → AirSim sends PNG bytes → cv2.imdecode works correctly.
+        compress=False → raw pixel bytes → cv2.imdecode fails silently (old bug).
+        Fallback: if compressed decode fails, try reshape from raw bytes.
         """
         if not self.available:
             return None
         try:
             import cv2
+
+            # Request compressed PNG — imdecode handles this correctly
             resp = self._c.simGetImages([
-                _air.ImageRequest(camera, _air.ImageType.Scene, False, False)
+                _air.ImageRequest(camera, _air.ImageType.Scene, False, True)
             ], vehicle_name=vehicle)
-            if resp and resp[0].image_data_uint8:
-                arr = np.frombuffer(resp[0].image_data_uint8, dtype=np.uint8)
-                return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+            if not resp or not resp[0].image_data_uint8:
+                return None
+
+            arr = np.frombuffer(resp[0].image_data_uint8, dtype=np.uint8)
+
+            # Compressed path (PNG/JPEG)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if frame is not None:
+                return frame
+
+            # Fallback: raw RGB bytes → reshape → BGR for OpenCV
+            h, w = resp[0].height, resp[0].width
+            if arr.size == h * w * 3:
+                return cv2.cvtColor(arr.reshape(h, w, 3), cv2.COLOR_RGB2BGR)
+
         except Exception:
             pass
         return None
