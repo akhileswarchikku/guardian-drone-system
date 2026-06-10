@@ -25,11 +25,12 @@ from simulation.airsim_client import AirSimClient
 from simulation.environment import ORIGIN_LAT, ORIGIN_LON, gps_to_ned
 
 
-# ── Starting positions (Madhapur area, Hyderabad) ──────────────────────────────
-VICTIM_LAT   = 17.4450
-VICTIM_LON   = 78.3900
-ATTACKER_LAT = 17.4448   # ~22 m south of victim — close enough to "attack"
-ATTACKER_LON = 78.3898
+# ── Starting positions (~60 miles from Hyderabad, near Yadadri district) ────────
+# Distance from Madhapur PS (17.4410N, 78.3830E): 97.9 km = 60.8 miles
+VICTIM_LAT   = 17.8100
+VICTIM_LON   = 79.2200
+ATTACKER_LAT = 17.80987   # ~21 m SW of victim — attacker right on top of victim
+ATTACKER_LON = 79.21986
 
 
 @dataclass

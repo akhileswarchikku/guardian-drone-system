@@ -620,12 +620,12 @@ def main(fly: bool = True) -> None:
     # ── 7. Drone flight ────────────────────────────────────────────────────────
     if fly:
         _phase_header("6/6  DRONE FLIGHT (PX4 OFFBOARD)")
-        print("  Note: AirSim Blocks world = Seattle. Drone flies a local 50m demo")
-        print("  path. Victim GPS (Hyderabad) drives relative waypoint updates.\n")
+        print("  Note: AirSim Blocks world = Seattle. Victim is 60 miles away (Yadadri).")
+        print("  Drone flies 316m NE at 50m AGL in AirSim. GPS delta tracks victim.\n")
 
         # Local AirSim demo target — drone starts at origin, flies 50m north.
         # GPS tracker nudges this by victim's relative movement each second.
-        ned_target = [50.0, 0.0, -25.0]   # shared mutable [north, east, z_ned] — 25m clears Blocks buildings
+        ned_target = [300.0, 100.0, -50.0]   # 60-mile scenario: fly 316m NE at 50m alt — clears all obstacles
         ned_lock   = threading.Lock()
 
         # GPS tracking updates ned_target with relative victim movement
