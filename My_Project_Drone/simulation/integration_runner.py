@@ -243,6 +243,7 @@ def _fly_to_victim(
 
             # Prefer live AirSim frame; fall back to mock
             frame = airsim_client.get_rgb_frame() if airsim_client is not None else None
+            avoid_src = "AIRSIM-LIVE" if frame is not None else "synthetic-mock"
             if frame is None and mock is not None:
                 frame = mock.next_frame()
             if frame is None:
@@ -255,10 +256,10 @@ def _fly_to_victim(
                 if analysis.n_blocked == 0 and analysis.n_passable == 0:
                     # No close obstacles — drift back to cruise altitude
                     _stream_z[0] = -cruise_alt
-                    print(f"  [Avoid] Clear — holding alt={cruise_alt:.0f}m")
+                    print(f"  [Avoid] src=[{avoid_src}] Clear — holding alt={cruise_alt:.0f}m")
                     continue
 
-                print(f"  [Avoid] Detected: {analysis.summary}")
+                print(f"  [Avoid] src=[{avoid_src}] Detected: {analysis.summary}")
 
                 # A* from drone position (bottom-centre of frame) to goal (top-centre)
                 waypoints_2d = plan_path(
@@ -404,10 +405,11 @@ def _vision_loop(
 
         # Try AirSim camera first, fall back to synthetic distress frame
         frame = airsim_client.get_rgb_frame()
-        src   = "AirSim"
-        if frame is None:
+        if frame is not None:
+            src = "AIRSIM-LIVE"
+        else:
             frame = mock.next_frame()
-            src   = "synthetic"
+            src   = "synthetic-mock"
 
         try:
             result = clf.classify(
@@ -418,10 +420,9 @@ def _vision_loop(
                 mission_status = "flying",
             )
             print(
-                f"  [Vision] frame={frame_n:03d} ({src})  "
-                f"scene={result.scene_type}  "
-                f"threat={result.threat_level}/5  "
-                f"-> {result.recommended_action[:60]}"
+                f"  [Vision] frame={frame_n:03d} src=[{src}]  "
+                f"scene={result.scene_type}  threat={result.threat_level}/5  "
+                f"-> {result.recommended_action[:55]}"
             )
         except Exception as e:
             print(f"  [Vision] frame={frame_n:03d} error: {type(e).__name__}: {e}")
@@ -551,6 +552,26 @@ def _gps_track_loop(
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _check_camera(airsim_client) -> bool:
+    """
+    Grab one frame from the AirSim front_center camera and report the result.
+    Returns True if a real frame was received, False if falling back to mock.
+    """
+    print("\n  [Camera] Testing AirSim front_center camera ...")
+    frame = airsim_client.get_rgb_frame()
+    if frame is None:
+        print("  [Camera] *** RESULT: None — AirSim returned no frame ***")
+        print("  [Camera]     Vision will use SYNTHETIC (mock) frames")
+        print("  [Camera]     Possible causes: Blocks not running, camera not")
+        print("  [Camera]     configured in settings.json, or AirSim API mismatch")
+        return False
+    else:
+        h, w, c = frame.shape
+        print(f"  [Camera] *** RESULT: OK — real frame received ({w}x{h} px, {c}ch BGR) ***")
+        print(f"  [Camera]     Vision will use REAL drone camera feed")
+        return True
+
+
 def main(fly: bool = True) -> None:
     _banner(
         "GUARDIAN DRONE — FULL INTEGRATION DEMO\n"
@@ -565,6 +586,7 @@ def main(fly: bool = True) -> None:
     # ── 1. AirSim scene setup ─────────────────────────────────────────────────
     _phase_header("1/6  SCENE SETUP")
     airsim = AirSimClient()
+    _check_camera(airsim)   # prints OK/None immediately so user knows camera status
     scene  = AttackScene(airsim)
     scene.setup()
     scene.start()   # begins continuous movement in background
