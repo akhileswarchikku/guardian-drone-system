@@ -323,20 +323,39 @@ def _fly_to_victim(
         print(f"  [Drone] flying  NED=({n:.1f},{e:.1f})  alt={alt:.1f}m", end="\r")
         time.sleep(1.0)
 
-    # Land — set stream z to 0 so drone descends
-    print("\n  [Drone] Descending to land ...")
-    _stream_z[0] = 0.0
+    # Land — switch PX4 to AUTO.LAND mode so it commits to a full landing
+    # regardless of altitude. Setting z=0 in OFFBOARD at 50m can timeout
+    # before touchdown; AUTO.LAND descends at full rate until disarm.
+    # PX4 custom_mode encoding: main_mode=4 (AUTO) at bits 16-23,
+    #                           sub_mode=6  (LAND) at bits 24-31
+    PX4_AUTO_LAND = (4 << 16) | (6 << 24)
+
+    print("\n  [Drone] Switching to AUTO.LAND ...")
+    for _ in range(5):   # send a few times so PX4 doesn't miss it
+        mav.mav.set_mode_send(
+            mav.target_system,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            PX4_AUTO_LAND,
+        )
+        time.sleep(0.2)
+
+    # Wait for touchdown — 60s is generous for any cruise altitude
     t0 = time.time()
     while True:
         with _lock:
             alt = _state["alt"]
-        if alt < 0.5 or time.time() - t0 > 20:
+        print(f"  [Drone] descending  alt={alt:5.1f}m", end="\r")
+        if alt < 0.5:
+            print(f"\n  [Drone] Touchdown confirmed at {alt:.1f}m")
+            break
+        if time.time() - t0 > 60:
+            print(f"\n  [Drone] Land timeout — alt={alt:.1f}m (PX4 still descending)")
             break
         time.sleep(0.5)
 
     _stop_stream.set()
-    print(f"  [Drone] Landed. Final alt={_state['alt']:.1f}m")
-    return _ned_target   # so caller can update
+    print(f"  [Drone] Mission ended. Final alt={_state['alt']:.1f}m")
+    return _ned_target
 
 
 # ── Vision pipeline ───────────────────────────────────────────────────────────
