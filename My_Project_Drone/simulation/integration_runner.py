@@ -70,14 +70,23 @@ def _phase_header(label: str) -> None:
 
 # ── Drone flight (pure pymavlink OFFBOARD) ────────────────────────────────────
 
-def _fly_to_victim(ned_target: list, stop_event: threading.Event) -> None:
+def _fly_to_victim(
+    ned_target: list,
+    ned_lock: threading.Lock,
+    stop_event: threading.Event,
+    airsim_client=None,
+    mock=None,
+) -> None:
     """
     Fly DRONE_1 via PX4 OFFBOARD using the shared ned_target list [north, east, z].
     ned_target is the same list object that the GPS tracking loop updates in main(),
     so drone waypoint stays in sync with victim movement automatically.
 
+    airsim_client + mock: passed in so the obstacle avoidance inner loop can grab
+    camera/depth frames without creating a new connection.
+
     NOTE: AirSim Blocks world origin is Seattle; Hyderabad GPS → NED = 15M metres.
-    ned_target must contain local AirSim coordinates (e.g. [50, 0, -10]).
+    ned_target must contain local AirSim coordinates (e.g. [50, 0, -25]).
     """
     from pymavlink import mavutil
 
@@ -211,6 +220,98 @@ def _fly_to_victim(ned_target: list, stop_event: threading.Event) -> None:
             print(f"\n  [Drone] Climb timeout at {alt:.1f}m")
             break
         time.sleep(0.5)
+
+    # ── Obstacle avoidance (A* + MiDaS depth) ────────────────────────────────
+    # Inner closure: has direct access to _stream_z, ned_target, ned_lock,
+    # stop_event, airsim_client, mock, cruise_alt — no extra plumbing needed.
+    def _avoid_loop(interval_s: float = 5.0) -> None:
+        try:
+            from vision.obstacle_mapper import ObstacleMapper
+            from vision.occupancy_grid import plan_path, assign_altitudes
+        except ImportError as e:
+            print(f"  [Avoid] Import failed: {e}")
+            return
+
+        mapper = ObstacleMapper(model_size="n", use_midas=True)
+        print("  [Avoid] Obstacle avoidance active (YOLOv8-seg + MiDaS + A*, every 5s)")
+        PX_TO_M = 0.10  # camera FOV 90°, ~0.1 m/px lateral at typical range
+
+        while not stop_event.is_set():
+            time.sleep(interval_s)
+            if stop_event.is_set():
+                break
+
+            # Prefer live AirSim frame; fall back to mock
+            frame = airsim_client.get_rgb_frame() if airsim_client is not None else None
+            if frame is None and mock is not None:
+                frame = mock.next_frame()
+            if frame is None:
+                continue
+
+            try:
+                analysis = mapper.analyze(frame)
+                h, w = analysis.frame_h, analysis.frame_w
+
+                if analysis.n_blocked == 0 and analysis.n_passable == 0:
+                    # No close obstacles — drift back to cruise altitude
+                    _stream_z[0] = -cruise_alt
+                    print(f"  [Avoid] Clear — holding alt={cruise_alt:.0f}m")
+                    continue
+
+                print(f"  [Avoid] Detected: {analysis.summary}")
+
+                # A* from drone position (bottom-centre of frame) to goal (top-centre)
+                waypoints_2d = plan_path(
+                    analysis.obstacle_mask,
+                    start=(h - 1, w // 2),
+                    goal =(0,     w // 2),
+                )
+
+                if not waypoints_2d:
+                    # Fully blocked — climb over the tallest object
+                    max_obj_h = max(
+                        (o.estimated_height_m for o in analysis.objects),
+                        default=cruise_alt,
+                    )
+                    new_alt = max_obj_h + 3.0
+                    _stream_z[0] = -new_alt
+                    print(f"  [Avoid] No path — climbing to {new_alt:.1f}m")
+                    continue
+
+                # Attach per-waypoint altitude from detected object heights
+                waypoints_3d = assign_altitudes(
+                    waypoints_2d,
+                    analysis.objects,
+                    h, w,
+                    default_alt_m = cruise_alt,
+                    clearance_m   = 3.0,
+                    min_alt_m     = cruise_alt,
+                    max_alt_m     = 40.0,
+                )
+
+                # Steer toward 1/4-point of path — avoids overreacting to far waypoints
+                steer_idx = max(1, len(waypoints_3d) // 4)
+                _, steer_col, steer_alt = waypoints_3d[steer_idx]
+
+                # Column deviation from frame centre → east NED nudge
+                col_offset = steer_col - (w // 2)
+                east_nudge = col_offset * PX_TO_M
+
+                with ned_lock:
+                    ned_target[1] += east_nudge
+
+                _stream_z[0] = -steer_alt
+
+                print(
+                    f"  [Avoid] A* steer: col_offset={col_offset:+d}px  "
+                    f"east={east_nudge:+.1f}m  alt={steer_alt:.1f}m  "
+                    f"blocked={analysis.n_blocked} passable={analysis.n_passable}"
+                )
+
+            except Exception as e:
+                print(f"  [Avoid] frame error: {type(e).__name__}: {e}")
+
+    threading.Thread(target=_avoid_loop, daemon=True).start()
 
     # Cruise: GPS tracking loop updates ned_target[0]/[1] every second.
     # _stream reads n,e from ned_target and z from _stream_z (held at cruise alt).
@@ -524,7 +625,7 @@ def main(fly: bool = True) -> None:
 
         # Local AirSim demo target — drone starts at origin, flies 50m north.
         # GPS tracker nudges this by victim's relative movement each second.
-        ned_target = [50.0, 0.0, -10.0]   # shared mutable [north, east, z_ned]
+        ned_target = [50.0, 0.0, -25.0]   # shared mutable [north, east, z_ned] — 25m clears Blocks buildings
         ned_lock   = threading.Lock()
 
         # GPS tracking updates ned_target with relative victim movement
@@ -538,7 +639,8 @@ def main(fly: bool = True) -> None:
 
         # Flight runs in foreground — passes shared ned_target list so GPS loop
         # and drone stream thread read/write the same object.
-        _fly_to_victim(ned_target, stop_mission)
+        # airsim + mock passed so obstacle avoidance can grab live camera frames.
+        _fly_to_victim(ned_target, ned_lock, stop_mission, airsim, mock)
 
     else:
         print("  [Drone] --no-fly flag set — skipping PX4 flight")
